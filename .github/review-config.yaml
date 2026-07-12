@@ -18,7 +18,7 @@ llm:
   meta:
     # --- OpenAI ---
     model: ${LLM_API_MODEL}
-    max_tokens: 77777 # (optional) Maximum tokens for completion
+    max_tokens: 111111 # (optional) Maximum tokens for completion
     temperature: 0.3 # (optional) Creativity of responses (0 = deterministic)
     stream: true
 
