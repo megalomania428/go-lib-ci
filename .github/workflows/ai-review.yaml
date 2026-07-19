@@ -1,0 +1,85 @@
+---
+name: AI Review
+on:
+  # checkov:skip=CKV_GHA_7: dispatch only pipeline
+  workflow_dispatch:
+    inputs:
+      run:
+        description: "run — full review (inline + summary)"
+        type: boolean
+        default: false
+      run-inline:
+        description: "run-inline — inline code review comments"
+        type: boolean
+        default: false
+      run-context:
+        description: "run-context — context review"
+        type: boolean
+        default: true
+      run-summary:
+        description: "run-summary — summary review"
+        type: boolean
+        default: false
+      run-inline-reply:
+        description: "run-inline-reply — reply to inline comments"
+        type: boolean
+        default: false
+      run-summary-reply:
+        description: "run-summary-reply — reply to summary comments"
+        type: boolean
+        default: false
+      clear-inline:
+        description: "clear-inline — remove AI inline comments"
+        type: boolean
+        default: false
+      clear-summary:
+        description: "clear-summary — remove AI summary comments"
+        type: boolean
+        default: false
+      llm-api-url:
+        description: "custom API url"
+        type: string
+      llm-api-type:
+        description: "custom API type"
+        type: string
+      llm-api-model:
+        description: "custom API model"
+        type: string
+      llm-api-token:
+        description: "custom API token"
+        type: string
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7 # zizmor: ignore[unpinned-uses]
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+      - name: Run AI Review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AI_REVIEW_CONFIG_FILE_YAML: .github/review-config.yaml
+          GITHUB_REPOSITORY_NAME: ${{ github.event.repository.name }}
+          CMD_RUN: ${{ inputs.run }}
+          CMD_RUN_INLINE: ${{ inputs.run-inline }}
+          CMD_RUN_CONTEXT: ${{ inputs.run-context }}
+          CMD_RUN_SUMMARY: ${{ inputs.run-summary }}
+          CMD_RUN_INLINE_REPLY: ${{ inputs.run-inline-reply }}
+          CMD_RUN_SUMMARY_REPLY: ${{ inputs.run-summary-reply }}
+          CMD_CLEAR_INLINE: ${{ inputs.clear-inline }}
+          CMD_CLEAR_SUMMARY: ${{ inputs.clear-summary }}
+          LLM_API_URL: ${{ inputs.llm-api-url || secrets.LLM_API_URL }}
+          LLM_API_TYPE: ${{ inputs.llm-api-type || 'OPENAI' }}
+          LLM_API_TOKEN: "${{ inputs.llm-api-token ||
+            !inputs.llm-api-url && secrets.LLM_API_KEY || 'dummy' }}"
+          LLM_API_MODEL: ${{ inputs.llm-api-model || 'co-glm' }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: ".github/scripts/ai-review.sh"
