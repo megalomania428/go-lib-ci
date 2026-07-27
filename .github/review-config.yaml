@@ -55,7 +55,7 @@ llm:
     # max_tokens: 1200
     # temperature: 0.3
     # title: "AI Review"                   # (optional) project title for analytics
-    # referer: "https://your-domain.com"   # (optional) referer URL for analytics
+    # referer: "https://bedrock-runtime"   # (optional) referer URL for analytics
 
     # --- Azure OpenAI ---
     # model: gpt-4o-mini  # IMPORTANT: In Azure, the `model` field specifies the
