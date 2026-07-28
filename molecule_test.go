@@ -229,7 +229,7 @@ func fakeFetchOverride(srv *httptest.Server) func(*FetchOptions) {
 	return func(o *FetchOptions) {
 		o.APIBaseURL = srv.URL
 		o.NoProgressBar = true
-		o.RetryMax = 1
+		o.MaxRetriesTime = -1
 		o.StallTimeout = -1
 		o.HTTPClient = srv.Client()
 	}
@@ -302,7 +302,7 @@ func Test_fetchAppImage(t *testing.T) {
 				o.APIBaseURL = srv.URL
 				o.AssetName = assetName
 				o.NoProgressBar = true
-				o.RetryMax = 1
+				o.MaxRetriesTime = -1
 				o.StallTimeout = -1
 				o.HTTPClient = srv.Client()
 			},
@@ -323,7 +323,7 @@ func Test_fetchAppImage(t *testing.T) {
 			FetchOverride: func(o *FetchOptions) {
 				o.APIBaseURL = srv.URL
 				o.NoProgressBar = true
-				o.RetryMax = 1
+				o.MaxRetriesTime = -1
 				o.StallTimeout = -1
 				o.HTTPClient = srv.Client()
 			},
@@ -354,7 +354,7 @@ func Test_fetchAppImage(t *testing.T) {
 			FetchOverride: func(o *FetchOptions) {
 				o.APIBaseURL = authSrv.URL
 				o.NoProgressBar = true
-				o.RetryMax = 1
+				o.MaxRetriesTime = -1
 				o.StallTimeout = -1
 				o.HTTPClient = authSrv.Client()
 			},

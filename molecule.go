@@ -98,7 +98,7 @@ type PrepareOptions struct {
 	HomeDir string
 	// FetchOverride, when set, is called with the FetchOptions Prepare is
 	// about to use, allowing tests (or callers) to tweak fields such as
-	// APIBaseURL, RetryMax or NoProgressBar.
+	// APIBaseURL, MaxRetriesTime or NoProgressBar.
 	FetchOverride func(*FetchOptions)
 	// PackagesOverride, when set, is called with the EnsurePackagesOptions
 	// Prepare is about to use for EnsureMoreutils, allowing tests (or
