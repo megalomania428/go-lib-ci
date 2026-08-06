@@ -14,5 +14,5 @@ git clone --recursive git@github.com:megalomania428/go-lib-ci.git go-lib-ci
 
 ```bash
 git checkout master && git pull
-git tag -fm $(git branch --sho) v1.0.2 && git push --force origin $(git describe)
+git tag -fm $(git branch --sho) v1.0.3 && git push --force origin $(git describe)
 ```
