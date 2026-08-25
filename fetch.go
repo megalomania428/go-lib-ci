@@ -1,7 +1,6 @@
 // Package ci is documented in doc.go.
-// cspell:ignore Ewma Kibi Rbound TCGETS vbauerster badurl copyerr defaultdest isdir
-// cspell:ignore rawhex stallsig syncfail barwidth barmove noprogress barw KMGTPE
-// cspell:ignore unparseable alives
+// cspell:ignore badurl copyerr defaultdest isdir alives noprogress
+// cspell:ignore rawhex stallsig syncfail
 package ci
 
 import (
@@ -11,20 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/vbauerster/mpb/v8"
-	"github.com/vbauerster/mpb/v8/decor"
-	"golang.org/x/term"
 )
 
 // DownloadOptions controls FetchURL. It carries the transport-agnostic knobs
@@ -82,12 +75,6 @@ const (
 	defaultBackoffStep         = 1 * time.Second
 	defaultBackoffStepAttempts = 3
 	defaultBackoffCap          = 7 * time.Second
-	ciBarWidth                 = 79
-	// ciBarMarkerLen is the length of the "-=O=-" bar marker. barPos is
-	// clamped to [0, w-ciBarMarkerLen-1] so the marker fits within the line.
-	ciBarMarkerLen  = 5
-	ciRefreshPeriod = 100 * time.Millisecond
-	ciWaveSineSteps = 200
 )
 
 // BackoffOptions carries the retry/backoff schedule knobs shared by
@@ -172,15 +159,6 @@ var osOpenPart = func(name string, truncate bool) (tempFile, error) {
 	return os.OpenFile(name, flag, 0o644)
 }
 
-var ciSinusTable = func() [ciWaveSineSteps]int {
-	var t [ciWaveSineSteps]int
-	for i := 0; i < ciWaveSineSteps; i++ {
-		v := math.Sin(float64(i) / float64(ciWaveSineSteps) * 2 * math.Pi)
-		t[i] = int(v*500000 + 500000)
-	}
-	return t
-}()
-
 // applyDownloadDefaults fills the zero-value fields of opts with their
 // documented defaults. It is safe to call more than once.
 func applyDownloadDefaults(opts *DownloadOptions) {
@@ -256,21 +234,25 @@ func partPath(opts *DownloadOptions, dest string) string {
 
 func downloadOnce(
 	ctx context.Context, opts *DownloadOptions, url, dest, part string,
-) error {
+) (retErr error) {
 	if url == "" {
 		return errors.New("empty download URL")
 	}
 	dlCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stalled := &atomic.Bool{}
-	// Start the CI progress renderer before the HTTP request so that the
-	// connect and TLS handshake phases are covered by the wave animation.
-	var ciR *ciRenderer
-	if !opts.NoProgressBar && useCIProgress(opts) {
-		ciR = newCIRenderer(opts.Stderr, -1)
-		ciR.Start(dlCtx)
-		defer ciR.Stop()
-	}
+	// Single progress bar for the whole attempt: created before the HTTP
+	// request so wave/indeterminate animation covers connect and TLS, then
+	// reconfigured with the real total once the response arrives.
+	bar := NewProgressBar(dlCtx, ProgressOptions{
+		Name:          opts.Name,
+		Total:         -1,
+		Stderr:        opts.Stderr,
+		CIMode:        opts.CIMode,
+		NoProgressBar: opts.NoProgressBar,
+	})
+	defer func() { bar.Finish(retErr) }()
+
 	// A previous attempt may have left a partial file; ask the server for the
 	// remaining bytes via Range so the transfer resumes instead of restarting.
 	existing := partialSize(part)
@@ -327,18 +309,13 @@ func downloadOnce(
 			_ = os.Remove(part)
 		}
 	}()
-	if ciR != nil {
-		ciR.SetTotal(total)
-		if resume {
-			ciR.AddBytes(existing)
-		}
+	bar.SetTotal(total)
+	if resume {
+		bar.AddBytes(existing)
 	}
 	var counter atomic.Int64
 	src := &countingReader{r: resp.Body, onRead: func(n int64) {
 		counter.Add(n)
-		if ciR != nil {
-			ciR.AddBytes(n)
-		}
 	}}
 	if opts.StallTimeout > 0 {
 		go watchdog(
@@ -346,16 +323,19 @@ func downloadOnce(
 			opts.Stderr, opts.Name,
 		)
 	}
-	if err := copyWithProgress(dlCtx, opts, tmp, src, total, ciR); err != nil {
+	wrapped := bar.WrapReader(src)
+	_, copyErr := io.Copy(tmp, wrapped)
+	_ = wrapped.Close()
+	if copyErr != nil {
 		// Keep the partial file on transfer errors and stalls: preserving it
 		// is exactly what lets the next attempt resume from where this left.
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if stalled.Load() {
-			return fmt.Errorf("transfer stalled: %w", err)
+			return fmt.Errorf("transfer stalled: %w", copyErr)
 		}
-		return err
+		return copyErr
 	}
 	if err := tmp.Sync(); err != nil {
 		return err
@@ -429,378 +409,6 @@ func parseContentRangeTotal(header string) int64 {
 	return total
 }
 
-func copyWithProgress(
-	ctx context.Context, opts *DownloadOptions, dst io.Writer, src io.Reader,
-	total int64, ciR *ciRenderer,
-) error {
-	if opts.NoProgressBar || ciR != nil {
-		_, err := io.Copy(dst, src)
-		return err
-	}
-	return copyWithMpb(ctx, opts, dst, src, total)
-}
-
-func useCIProgress(opts *DownloadOptions) bool {
-	if opts.CIMode != nil {
-		return *opts.CIMode
-	}
-	f, ok := opts.Stderr.(*os.File)
-	if !ok {
-		return true
-	}
-	return !term.IsTerminal(int(f.Fd()))
-}
-
-func copyWithMpb(
-	ctx context.Context, opts *DownloadOptions, dst io.Writer, src io.Reader, total int64,
-) error {
-	p := mpb.NewWithContext(
-		ctx,
-		mpb.WithOutput(opts.Stderr),
-		mpb.WithRefreshRate(150*time.Millisecond),
-	)
-	bar := p.New(
-		total,
-		mpb.BarStyle().Rbound("|"),
-		mpb.PrependDecorators(
-			decor.Name(opts.Name+" "),
-			decor.CountersKibiByte("% .2f / % .2f"),
-		),
-		mpb.AppendDecorators(
-			decor.EwmaSpeed(decor.SizeB1024(0), " % .2f", 60),
-			decor.Name(" "),
-			decor.EwmaETA(decor.ET_STYLE_GO, 60),
-		),
-	)
-	proxied := bar.ProxyReader(src)
-	_, err := io.Copy(dst, proxied)
-	proxied.Close()
-	if err != nil {
-		bar.Abort(false)
-	} else {
-		bar.SetTotal(-1, true)
-	}
-	p.Wait()
-	return err
-}
-
-// ciRenderer prints a progress bar with one frame per line, so that CI log
-// viewers that do not honor carriage returns keep every frame in the log as
-// a vertical trail.
-//
-// While no bytes have arrived yet it prints wave frames (a moving "-=O=-"
-// marker plus four "#" characters walking along a sine curve), matching the
-// look of curl's fly() in tool_cb_prg.c. Once the first byte is received it
-// switches to a pv-style line like:
-//
-//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------] 30% ETA 0:05:58
-//
-// A new line is printed whenever the progress bar advances by at least one
-// character or after ciRefreshPeriod, whichever comes first.
-type ciRenderer struct {
-	out       io.Writer
-	barWidth  int // line width; defaults to ciBarWidth when zero
-	total     atomic.Int64
-	counter   atomic.Int64
-	stop      chan struct{}
-	done      chan struct{}
-	mu        sync.Mutex
-	startedAt time.Time
-	tick      int
-	barPos    int
-	barMove   int
-	lastBar   int
-	lastPrint time.Time
-	// EWMA speed state, bytes per second.
-	speedEWMA   float64
-	speedLastAt time.Time
-	speedLastN  int64
-	started     bool
-}
-
-func newCIRenderer(out io.Writer, total int64) *ciRenderer {
-	r := &ciRenderer{
-		out:     out,
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
-		barMove: 1,
-		tick:    150,
-	}
-	r.total.Store(total)
-	return r
-}
-
-// SetTotal updates the expected transfer size once known.
-func (r *ciRenderer) SetTotal(total int64) {
-	r.total.Store(total)
-}
-
-func (r *ciRenderer) Start(ctx context.Context) {
-	r.mu.Lock()
-	if r.started {
-		r.mu.Unlock()
-		return
-	}
-	r.started = true
-	r.startedAt = time.Now()
-	r.mu.Unlock()
-	go r.loop(ctx)
-}
-
-func (r *ciRenderer) Stop() {
-	r.mu.Lock()
-	if !r.started {
-		r.mu.Unlock()
-		return
-	}
-	r.mu.Unlock()
-	select {
-	case <-r.stop:
-	default:
-		close(r.stop)
-	}
-	<-r.done
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	total := r.total.Load()
-	cur := r.counter.Load()
-	if total > 0 && cur > 0 {
-		final := r.renderHashLine(cur, total)
-		fmt.Fprintln(r.out, final)
-	}
-}
-
-// AddBytes is called by the counting reader on every Read.
-func (r *ciRenderer) AddBytes(n int64) {
-	if n > 0 {
-		r.counter.Add(n)
-	}
-}
-
-func (r *ciRenderer) loop(ctx context.Context) {
-	defer close(r.done)
-	ticker := time.NewTicker(ciRefreshPeriod)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-r.stop:
-			return
-		case <-ticker.C:
-			r.frame()
-		}
-	}
-}
-
-func (r *ciRenderer) frame() {
-	cur := r.counter.Load()
-	now := time.Now()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cur == 0 {
-		fmt.Fprintln(r.out, r.renderWaveLine(true))
-		return
-	}
-	r.updateSpeed(cur, now)
-	total := r.total.Load()
-	if total <= 0 {
-		fmt.Fprintln(r.out, r.renderWaveLineWithBytes(cur))
-		return
-	}
-	r.printPVIfChanged(cur, total, now)
-}
-
-// updateSpeed maintains an EWMA of the throughput in bytes per second with a
-// ~1 second time constant, matching pv -r behavior.
-func (r *ciRenderer) updateSpeed(cur int64, now time.Time) {
-	if r.speedLastAt.IsZero() {
-		r.speedLastAt = now
-		r.speedLastN = cur
-		return
-	}
-	dt := now.Sub(r.speedLastAt).Seconds()
-	if dt <= 0 {
-		return
-	}
-	inst := float64(cur-r.speedLastN) / dt
-	if inst < 0 {
-		inst = 0
-	}
-	const tau = 1.0
-	alpha := 1 - math.Exp(-dt/tau)
-	if r.speedEWMA == 0 {
-		r.speedEWMA = inst
-	} else {
-		r.speedEWMA = alpha*inst + (1-alpha)*r.speedEWMA
-	}
-	r.speedLastAt = now
-	r.speedLastN = cur
-}
-
-func (r *ciRenderer) printPVIfChanged(cur, total int64, now time.Time) {
-	line, bar, _ := r.pvLine(cur, total, now)
-	sinceLast := now.Sub(r.lastPrint)
-	if r.lastPrint.IsZero() || bar != r.lastBar || sinceLast >= time.Second {
-		fmt.Fprintln(r.out, line)
-		r.lastBar = bar
-		r.lastPrint = now
-	}
-}
-
-func (r *ciRenderer) renderHashLine(cur, total int64) string {
-	line, _, _ := r.pvLine(cur, total, time.Now())
-	return line
-}
-
-// pvLine renders a pv-style progress line:
-//
-//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------] 30% ETA 0:05:58
-//
-// It returns the line, the number of filled bar cells (used for update
-// throttling) and the percent value.
-func (r *ciRenderer) pvLine(cur, total int64, now time.Time) (string, int, float64) {
-	if cur > total {
-		cur = total
-	}
-	frac := float64(cur) / float64(total)
-	pct := frac * 100.0
-	elapsed := now.Sub(r.startedAt)
-	var eta time.Duration
-	if r.speedEWMA > 1 && cur < total {
-		eta = time.Duration(float64(total-cur)/r.speedEWMA) * time.Second
-	}
-	prefix := fmt.Sprintf(
-		"%s/%s %s [%s/s] ",
-		humanBytes(cur, true), humanBytes(total, true),
-		formatDuration(elapsed), humanBytes(int64(r.speedEWMA), true),
-	)
-	suffix := fmt.Sprintf(" %3.0f%% ETA %s", pct, formatDuration(eta))
-	if cur >= total {
-		suffix = fmt.Sprintf(" %3.0f%%", pct)
-	}
-	barw := r.lineWidth() - len(prefix) - len(suffix) - 2
-	if barw < 4 {
-		barw = 4
-	}
-	filled := int(float64(barw) * frac)
-	bar := make([]byte, barw)
-	for i := 0; i < filled; i++ {
-		bar[i] = '='
-	}
-	head := filled
-	if head < barw && cur < total {
-		bar[head] = '>'
-		head++
-	}
-	for i := head; i < barw; i++ {
-		bar[i] = '-'
-	}
-	return prefix + "[" + string(bar) + "]" + suffix, filled, pct
-}
-
-// humanBytes renders a byte count as a human-readable string. When short is
-// true the output uses compact pv-style single-letter suffixes without spaces
-// (e.g. "3.0M"). When short is false it uses IEC binary suffixes with spaces
-// (e.g. "3.0 MiB"), as used by curl's wave-line display.
-func humanBytes(n int64, short bool) string {
-	if n < 0 {
-		n = 0
-	}
-	const unit = 1024
-	const suffixes = "KMGTPE"
-	if n < unit {
-		if short {
-			return fmt.Sprintf("%dB", n)
-		}
-		return fmt.Sprintf("%d B", n)
-	}
-	f, idx := float64(n)/unit, 0
-	for f >= unit && idx < len(suffixes)-1 {
-		f /= unit
-		idx++
-	}
-	if short {
-		if f >= 100 {
-			return fmt.Sprintf("%.0f%c", f, suffixes[idx])
-		}
-		return fmt.Sprintf("%.1f%c", f, suffixes[idx])
-	}
-	return fmt.Sprintf("%.1f %ciB", f, suffixes[idx])
-}
-
-// formatDuration renders a duration as h:mm:ss, matching pv output like
-// "0:01:06" and "0:05:58".
-func formatDuration(d time.Duration) string {
-	if d < 0 {
-		d = 0
-	}
-	total := int64(d.Seconds())
-	h := total / 3600
-	m := (total % 3600) / 60
-	s := total % 60
-	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
-}
-
-func (r *ciRenderer) lineWidth() int {
-	if r.barWidth > 0 {
-		return r.barWidth
-	}
-	return ciBarWidth
-}
-
-// renderWaveLine mirrors the fly() function from curl's tool_cb_prg.c. The
-// "-=O=-" marker walks left-to-right, then right-to-left, while four "#"
-// characters ride four sine waves shifted by 5 ticks each. The tick counter
-// is advanced by 2 per frame, exactly like curl.
-func (r *ciRenderer) renderWaveLine(advance bool) string {
-	w := r.lineWidth()
-	buf := make([]byte, w)
-	for i := 0; i < w; i++ {
-		buf[i] = ' '
-	}
-	check := w - 2
-	if r.barPos >= 0 && r.barPos+ciBarMarkerLen <= w {
-		copy(buf[r.barPos:], "-=O=-")
-	}
-	if check > 0 {
-		for _, shift := range []int{0, 5, 10, 15} {
-			pos := ciSinusTable[(r.tick+shift)%ciWaveSineSteps]/(1000000/check) + 1
-			if pos >= 0 && pos < w {
-				buf[pos] = '#'
-			}
-		}
-	}
-	if advance {
-		r.tick += 2
-		if r.tick >= ciWaveSineSteps {
-			r.tick -= ciWaveSineSteps
-		}
-		r.barPos += r.barMove
-		if r.barPos >= w-ciBarMarkerLen-1 {
-			r.barMove = -1
-			r.barPos = w - ciBarMarkerLen - 1
-		} else if r.barPos < 0 {
-			r.barMove = 1
-			r.barPos = 0
-		}
-	}
-	return string(buf)
-}
-
-func (r *ciRenderer) renderWaveLineWithBytes(cur int64) string {
-	line := []byte(r.renderWaveLine(true))
-	// Right-align the human-readable byte count inside the fixed-width buffer
-	// by overwriting the trailing bytes, preserving a single space separator.
-	suffix := humanBytes(cur, false)
-	pos := len(line) - len(suffix)
-	if pos > 0 {
-		line[pos-1] = ' '
-		copy(line[pos:], suffix)
-	}
-	return string(line)
-}
-
 func watchdog(
 	ctx context.Context, cancel context.CancelFunc, stalled *atomic.Bool,
 	counter *atomic.Int64, window time.Duration, limit int64, stderr io.Writer,
@@ -828,19 +436,6 @@ func watchdog(
 			prev = cur
 		}
 	}
-}
-
-type countingReader struct {
-	r      io.Reader
-	onRead func(int64)
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	if n > 0 {
-		c.onRead(int64(n))
-	}
-	return n, err
 }
 
 // closeIdler is implemented by *http.Transport and lets Retry drop pooled
