@@ -1,6 +1,6 @@
 module github.com/megalomania428/go-lib-ci
 
-go 1.25.12
+go 1.25.13
 
 require (
 	github.com/vbauerster/mpb/v8 v8.9.3
