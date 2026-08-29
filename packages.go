@@ -1,5 +1,5 @@
 // Package ci is documented in doc.go.
-// cspell:ignore dpkg Dpkg
+// cspell:ignore dpkg noninteractive
 package ci
 
 import (

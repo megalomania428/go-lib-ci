@@ -1,5 +1,5 @@
 // Package ci is documented in doc.go.
-// cspell:ignore appimage roles2test dpkg dconverge
+// cspell:ignore appimage roles2test dpkg dconverge gaiad moreutils
 package ci
 
 import (
