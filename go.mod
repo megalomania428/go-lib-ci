@@ -3,6 +3,7 @@ module github.com/megalomania428/go-lib-ci
 go 1.25.13
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/vbauerster/mpb/v8 v8.9.3
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0

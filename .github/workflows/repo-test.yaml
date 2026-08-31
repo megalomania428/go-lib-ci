@@ -89,10 +89,8 @@ jobs:
           fetch-depth: 0
           submodules: true
           persist-credentials: false
-      - name: MegaLinter
-        uses: oxsecurity/megalinter@v9
-        env:
-          VALIDATE_ALL_CODEBASE: true
+      - name: Run MegaLinter
+        uses: megalomania428/github-actions/megalinter@master
   all-green:
     name: all green
     timeout-minutes: 5

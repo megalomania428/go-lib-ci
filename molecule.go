@@ -1,5 +1,5 @@
 // Package ci is documented in doc.go.
-// cspell:ignore appimage roles2test dpkg dconverge
+// cspell:ignore appimage roles2test dpkg dconverge gaiad moreutils
 package ci
 
 import (
@@ -11,7 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
+
+	"github.com/google/uuid"
 )
 
 // defaultAppImageName is used when PrepareOptions.AppImageName is empty.
@@ -30,7 +31,7 @@ const GitHubTokenEnv = "ANSIBLE_GITHUB_TOKEN"
 // is false, reproducing the historical shared-host layout.
 const defaultRolesPath = "/tmp/ansible/roles2test"
 
-// defaultLogBase is the prefix (before the timestamp) used for
+// defaultLogBase is the prefix (before the uuid suffix) used for
 // ANSIBLE_LOG_PATH when PrepareOptions.Isolated is false.
 const defaultLogBase = "/tmp/molecule"
 
@@ -43,16 +44,14 @@ const defaultIsolatedBase = "/var/tmp"
 // temporary directory, preferred over defaultIsolatedBase when present.
 const runnerTempEnv = "RUNNER_TEMP"
 
-// timestampLayout mirrors the shell `date '+%Y%m%d%H%M%S.%3N'` format used by
-// the historical run-tests.sh scripts.
-const timestampLayout = "20060102150405.000"
-
-// timeNow is overridden in tests for deterministic timestamps.
-var timeNow = time.Now
-
-// mkdirTempFn is overridden in tests to inject failures without touching the
-// real filesystem behavior.
-var mkdirTempFn = os.MkdirTemp
+// uuidV7 is overridden in tests for deterministic path suffixes.
+var uuidV7 = func() (string, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", err
+	}
+	return id.String(), nil
+}
 
 // osGetwdFn is overridden in tests to inject failures without touching the
 // real working directory.
@@ -90,7 +89,7 @@ type PrepareOptions struct {
 	// environment variable is used, falling back to defaultIsolatedBase.
 	TmpBase string
 	// TmpPrefix names the per-run unique directory when Isolated is true,
-	// e.g. "mega-base" yields "/var/tmp/mega-base-tests-<random>". Required
+	// e.g. "mega-base" yields "/var/tmp/mega-base-tests-<uuid>". Required
 	// when Isolated is true.
 	TmpPrefix string
 	// HomeDir overrides $HOME for locating the downloaded AppImage. When
@@ -159,15 +158,18 @@ func Prepare(ctx context.Context, opts PrepareOptions) (PrepareResult, error) {
 	}
 	appImageBin, err := fetchAppImage(ctx, opts, stdout, stderr)
 	if err != nil {
+		cleanupIsolatedDir(isolatedDir)
 		return PrepareResult{}, err
 	}
 	sourceDir := opts.SourceDir
 	if sourceDir == "" {
 		if sourceDir, err = osGetwdFn(); err != nil {
+			cleanupIsolatedDir(isolatedDir)
 			return PrepareResult{}, fmt.Errorf("resolve working directory: %w", err)
 		}
 	}
 	if err := linkRole(rolesPath, opts.RoleDir, sourceDir, stdout); err != nil {
+		cleanupIsolatedDir(isolatedDir)
 		return PrepareResult{}, err
 	}
 	return PrepareResult{
@@ -228,9 +230,12 @@ func fetchAppImage(
 // unique per-run directory, per PrepareOptions.Isolated.
 func resolveMoleculePaths(opts PrepareOptions) (rolesPath, logBase, isolatedDir string,
 	err error) {
+	suffix, err := uuidV7()
+	if err != nil {
+		return "", "", "", fmt.Errorf("generate uuid v7: %w", err)
+	}
 	if !opts.Isolated {
-		return defaultRolesPath, defaultLogBase + "-" + timeNow().Format(timestampLayout),
-			"", nil
+		return defaultRolesPath, defaultLogBase + "-" + suffix, "", nil
 	}
 	if opts.TmpPrefix == "" {
 		return "", "", "", errors.New("molecule: TmpPrefix is required when Isolated is true")
@@ -242,13 +247,23 @@ func resolveMoleculePaths(opts PrepareOptions) (rolesPath, logBase, isolatedDir 
 	if base == "" {
 		base = defaultIsolatedBase
 	}
-	dir, err := mkdirTempFn(base, opts.TmpPrefix+"-tests-*")
-	if err != nil {
+	dir := filepath.Join(base, opts.TmpPrefix+"-tests-"+suffix)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", "", "", fmt.Errorf("create isolated tmp dir: %w", err)
 	}
 	rolesPath = filepath.Join(dir, "roles2test")
-	logBase = filepath.Join(dir, "molecule-"+timeNow().Format(timestampLayout))
+	logBase = filepath.Join(dir, "molecule-"+suffix)
 	return rolesPath, logBase, dir, nil
+}
+
+// cleanupIsolatedDir removes the per-run directory created when Isolated is
+// true. Empty dir is a no-op, matching PrepareResult.IsolatedDir on shared
+// (non-isolated) runs.
+func cleanupIsolatedDir(dir string) {
+	if dir == "" {
+		return
+	}
+	_ = os.RemoveAll(dir)
 }
 
 // linkRole creates rolesPath if missing, then replaces rolesPath/roleDir with
@@ -310,7 +325,7 @@ func MoleculeCreate(ctx context.Context, opts MoleculeCreateOptions) error {
 	}
 	fmt.Fprint(stdout, "\n\n\nmolecule [create] action\n")
 	logPath := opts.LogBase + "-0create"
-	return runMolecule(ctx, opts.MoleculeBinary, stdout, stderr, logPath,
+	return runMolecule(ctx, opts.MoleculeBinary, stdout, stderr, logPath, "",
 		"molecule", "-v", "create", "-s", opts.Scenario)
 }
 
@@ -327,6 +342,10 @@ type RunGroupOptions struct {
 	// LogBase is the ANSIBLE_LOG_PATH prefix, typically
 	// PrepareResult.LogBase.
 	LogBase string
+	// RolesPath is prepended to ANSIBLE_ROLES_PATH before invoking molecule,
+	// typically PrepareResult.RolesPath. Empty leaves ANSIBLE_ROLES_PATH
+	// untouched, preserving whatever the caller inherited from os.Environ.
+	RolesPath string
 	// Counter is the shared step counter (bash `n`), incremented after every
 	// molecule invocation. Required, and must be reused across sequential
 	// RunGroup/MoleculeCreate calls belonging to the same run so that
@@ -366,7 +385,7 @@ func RunGroup(ctx context.Context, opts RunGroupOptions) error {
 	fmt.Fprintf(stdout, "\n\n\nmolecule [converge] %s check\n", label)
 	logPath := fmt.Sprintf("%s-%02dconverge%s-check", opts.LogBase, *opts.Counter, prefix)
 	if err := runMolecule(ctx, opts.MoleculeBinary, stdout, stderr, logPath,
-		moleculeArgs(opts.Scenario, "converge", checkArgs)...); err != nil {
+		opts.RolesPath, moleculeArgs(opts.Scenario, "converge", checkArgs)...); err != nil {
 		return err
 	}
 	*opts.Counter++
@@ -381,7 +400,7 @@ func RunGroup(ctx context.Context, opts RunGroupOptions) error {
 			logPath = fmt.Sprintf(
 				"%s-%02d%s%s-%s", opts.LogBase, *opts.Counter, stage, prefix, mode)
 			if err := runMolecule(ctx, opts.MoleculeBinary, stdout, stderr, logPath,
-				moleculeArgs(opts.Scenario, stage, args)...); err != nil {
+				opts.RolesPath, moleculeArgs(opts.Scenario, stage, args)...); err != nil {
 				return err
 			}
 			*opts.Counter++
@@ -435,16 +454,26 @@ func moleculeArgs(scenario, stage string, extra []string) []string {
 	return args
 }
 
-// runMolecule executes bin with args, setting ANSIBLE_LOG_PATH=logPath in its
-// environment and streaming its output to stdout/stderr.
+// runMolecule executes bin with args, setting ANSIBLE_LOG_PATH=logPath and
+// optionally prepending rolesPath to ANSIBLE_ROLES_PATH, then streaming
+// output to stdout/stderr.
 func runMolecule(
-	ctx context.Context, bin string, stdout, stderr io.Writer, logPath string,
-	args ...string,
+	ctx context.Context, bin string, stdout, stderr io.Writer,
+	logPath, rolesPath string, args ...string,
 ) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	cmd.Env = append(os.Environ(), "ANSIBLE_LOG_PATH="+logPath)
+	env := append(os.Environ(), "ANSIBLE_LOG_PATH="+logPath)
+	if rolesPath != "" {
+		existing := os.Getenv("ANSIBLE_ROLES_PATH")
+		combined := rolesPath
+		if existing != "" {
+			combined = rolesPath + ":" + existing
+		}
+		env = append(env, "ANSIBLE_ROLES_PATH="+combined)
+	}
+	cmd.Env = env
 	return cmd.Run()
 }
 

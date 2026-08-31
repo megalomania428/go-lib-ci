@@ -1,5 +1,5 @@
 // Package ci is documented in doc.go.
-// cspell:ignore appimage roles2test dpkg GOTESTS
+// cspell:ignore appimage roles2test dpkg GOTESTS gaiad moreutils
 package ci
 
 import (
@@ -14,18 +14,20 @@ import (
 	"path/filepath"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
-	"time"
+
+	"github.com/google/uuid"
 )
 
 // writeFakeBin creates an executable shell script at dir/name that prints its
-// arguments and the ANSIBLE_LOG_PATH environment variable to stdout, then
-// exits with the given code.
+// arguments and the ANSIBLE_LOG_PATH / ANSIBLE_ROLES_PATH environment
+// variables to stdout, then exits with the given code.
 func writeFakeBin(t *testing.T, dir, name string, code int) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
-	body := "#!/bin/sh\necho \"args: $*\"\necho \"ANSIBLE_LOG_PATH=$ANSIBLE_LOG_PATH\"\n" +
+	body := "#!/bin/sh\necho \"args: $*\"\n" +
+		"echo \"ANSIBLE_LOG_PATH=$ANSIBLE_LOG_PATH\"\n" +
+		"echo \"ANSIBLE_ROLES_PATH=$ANSIBLE_ROLES_PATH\"\n" +
 		"exit " + strconv.Itoa(code) + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake bin %s: %v", name, err)
@@ -181,22 +183,23 @@ func TestPrepare(t *testing.T) {
 
 	t.Run("link role failure with resolved paths propagates", func(t *testing.T) {
 		srv := newFakeAppImageServer(t, assetName, payload)
-		readOnlyDir := t.TempDir()
-		restore := mkdirTempFn
-		mkdirTempFn = func(string, string) (string, error) {
-			if err := os.Chmod(readOnlyDir, 0o555); err != nil {
-				return "", err
-			}
-			return readOnlyDir, nil
+		restore := uuidV7
+		uuidV7 = func() (string, error) { return "fixed-uuid", nil }
+		defer func() { uuidV7 = restore }()
+		base := t.TempDir()
+		isolated := filepath.Join(base, "mega-base-tests-fixed-uuid")
+		if err := os.MkdirAll(isolated, 0o755); err != nil {
+			t.Fatalf("seed isolated dir: %v", err)
 		}
-		defer func() {
-			mkdirTempFn = restore
-			_ = os.Chmod(readOnlyDir, 0o755)
-		}()
+		if err := os.Chmod(isolated, 0o555); err != nil {
+			t.Fatalf("chmod read-only: %v", err)
+		}
+		defer func() { _ = os.Chmod(isolated, 0o755) }()
 		_, err := Prepare(context.Background(), PrepareOptions{
 			RoleDir:       "role",
 			AppImageName:  assetName,
 			Isolated:      true,
+			TmpBase:       base,
 			TmpPrefix:     "mega-base",
 			HomeDir:       t.TempDir(),
 			FetchOverride: fakeFetchOverride(srv),
@@ -369,11 +372,9 @@ func Test_fetchAppImage(t *testing.T) {
 }
 
 func Test_resolveMoleculePaths(t *testing.T) {
-	fixedNow := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
-	restoreNow := timeNow
-	timeNow = func() time.Time { return fixedNow }
-	defer func() { timeNow = restoreNow }()
-	wantTS := fixedNow.Format(timestampLayout)
+	restoreUUID := uuidV7
+	uuidV7 = func() (string, error) { return "fixed-uuid", nil }
+	defer func() { uuidV7 = restoreUUID }()
 
 	t.Run("non isolated reuses shared paths", func(t *testing.T) {
 		rolesPath, logBase, isolatedDir, err := resolveMoleculePaths(PrepareOptions{})
@@ -383,7 +384,7 @@ func Test_resolveMoleculePaths(t *testing.T) {
 		if rolesPath != defaultRolesPath {
 			t.Errorf("rolesPath = %q, want %q", rolesPath, defaultRolesPath)
 		}
-		if want := defaultLogBase + "-" + wantTS; logBase != want {
+		if want := defaultLogBase + "-fixed-uuid"; logBase != want {
 			t.Errorf("logBase = %q, want %q", logBase, want)
 		}
 		if isolatedDir != "" {
@@ -406,14 +407,14 @@ func Test_resolveMoleculePaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveMoleculePaths() error = %v", err)
 		}
-		if !strings.HasPrefix(isolatedDir, filepath.Join(base, "mega-base-tests-")) {
-			t.Errorf("isolatedDir = %q, want prefix %q",
-				isolatedDir, filepath.Join(base, "mega-base-tests-"))
+		wantDir := filepath.Join(base, "mega-base-tests-fixed-uuid")
+		if isolatedDir != wantDir {
+			t.Errorf("isolatedDir = %q, want %q", isolatedDir, wantDir)
 		}
 		if want := filepath.Join(isolatedDir, "roles2test"); rolesPath != want {
 			t.Errorf("rolesPath = %q, want %q", rolesPath, want)
 		}
-		wantLogBase := filepath.Join(isolatedDir, "molecule-"+wantTS)
+		wantLogBase := filepath.Join(isolatedDir, "molecule-fixed-uuid")
 		if logBase != wantLogBase {
 			t.Errorf("logBase = %q, want %q", logBase, wantLogBase)
 		}
@@ -428,8 +429,9 @@ func Test_resolveMoleculePaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveMoleculePaths() error = %v", err)
 		}
-		if !strings.HasPrefix(isolatedDir, runnerTemp) {
-			t.Errorf("isolatedDir = %q, want prefix %q", isolatedDir, runnerTemp)
+		wantDir := filepath.Join(runnerTemp, "mega-base-tests-fixed-uuid")
+		if isolatedDir != wantDir {
+			t.Errorf("isolatedDir = %q, want %q", isolatedDir, wantDir)
 		}
 	})
 
@@ -442,24 +444,50 @@ func Test_resolveMoleculePaths(t *testing.T) {
 			t.Fatalf("resolveMoleculePaths() error = %v", err)
 		}
 		defer func() { _ = os.RemoveAll(isolatedDir) }()
-		if !strings.HasPrefix(isolatedDir, filepath.Join(defaultIsolatedBase,
-			"mega-base-default-base-test-tests-")) {
-			t.Errorf("isolatedDir = %q, want prefix under %q",
-				isolatedDir, defaultIsolatedBase)
+		wantDir := filepath.Join(defaultIsolatedBase,
+			"mega-base-default-base-test-tests-fixed-uuid")
+		if isolatedDir != wantDir {
+			t.Errorf("isolatedDir = %q, want %q", isolatedDir, wantDir)
 		}
 	})
 
-	t.Run("mkdir temp failure propagates", func(t *testing.T) {
-		restore := mkdirTempFn
-		mkdirTempFn = func(string, string) (string, error) {
-			return "", errors.New("boom")
+	t.Run("mkdir all failure propagates", func(t *testing.T) {
+		dir := t.TempDir()
+		blocker := filepath.Join(dir, "blocker")
+		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed blocker file: %v", err)
 		}
-		defer func() { mkdirTempFn = restore }()
 		_, _, _, err := resolveMoleculePaths(PrepareOptions{
-			Isolated: true, TmpBase: t.TempDir(), TmpPrefix: "mega-base",
+			Isolated: true, TmpBase: blocker, TmpPrefix: "mega-base",
 		})
 		if err == nil {
-			t.Error("expected error when mkdirTempFn fails")
+			t.Error("expected error when isolated tmp parent is a file")
+		}
+	})
+
+	t.Run("uuid failure propagates", func(t *testing.T) {
+		restore := uuidV7
+		uuidV7 = func() (string, error) { return "", errors.New("boom") }
+		defer func() { uuidV7 = restore }()
+		_, _, _, err := resolveMoleculePaths(PrepareOptions{})
+		if err == nil {
+			t.Error("expected error when uuidV7 fails")
+		}
+	})
+}
+
+func Test_cleanupIsolatedDir(t *testing.T) {
+	t.Run("empty dir is a no-op", func(_ *testing.T) {
+		cleanupIsolatedDir("")
+	})
+	t.Run("removes an existing directory", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "isolated")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("seed dir: %v", err)
+		}
+		cleanupIsolatedDir(dir)
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("cleanupIsolatedDir() left %q behind, stat err = %v", dir, err)
 		}
 	})
 }
@@ -589,6 +617,7 @@ func Test_firstNonEmpty(t *testing.T) {
 }
 
 func TestMoleculeCreate(t *testing.T) {
+	t.Setenv("ANSIBLE_ROLES_PATH", "")
 	dir := t.TempDir()
 	okBin := writeFakeBin(t, dir, "molecule-ok", 0)
 	failBin := writeFakeBin(t, dir, "molecule-fail", 1)
@@ -617,7 +646,8 @@ func TestMoleculeCreate(t *testing.T) {
 			checkStdout: true,
 			wantStdout: "\n\n\nmolecule [create] action\n" +
 				"args: molecule -v create -s default\n" +
-				"ANSIBLE_LOG_PATH=/tmp/molecule-x-0create\n",
+				"ANSIBLE_LOG_PATH=/tmp/molecule-x-0create\n" +
+				"ANSIBLE_ROLES_PATH=\n",
 		},
 		{
 			name: "default stdout and stderr are used when nil",
@@ -713,6 +743,14 @@ func TestRunGroup(t *testing.T) {
 			args: args{ctx: context.Background(), opts: RunGroupOptions{
 				MoleculeBinary: okBin, Scenario: "default", LogBase: "/tmp/molecule-x",
 				Tag: "service-gaiad,service-start", Counter: newIntPtr(1),
+			}},
+			wantCounter: 6,
+		},
+		{
+			name: "with roles path runs full sequence",
+			args: args{ctx: context.Background(), opts: RunGroupOptions{
+				MoleculeBinary: okBin, Scenario: "default", LogBase: "/tmp/molecule-x",
+				Counter: newIntPtr(1), RolesPath: "/tmp/some/roles",
 			}},
 			wantCounter: 6,
 		},
@@ -869,18 +907,21 @@ func Test_moleculeArgs(t *testing.T) {
 }
 
 func Test_runMolecule(t *testing.T) {
+	t.Setenv("ANSIBLE_ROLES_PATH", "")
 	dir := t.TempDir()
 	okBin := writeFakeBin(t, dir, "molecule-ok", 0)
 	failBin := writeFakeBin(t, dir, "molecule-fail", 3)
 	type args struct {
-		ctx     context.Context
-		bin     string
-		logPath string
-		args    []string
+		ctx       context.Context
+		bin       string
+		logPath   string
+		rolesPath string
+		args      []string
 	}
 	tests := []struct {
 		name       string
 		args       args
+		envRoles   string
 		wantStdout string
 		wantErr    bool
 	}{
@@ -891,20 +932,44 @@ func Test_runMolecule(t *testing.T) {
 				args: []string{"molecule", "-v", "create", "-s", "default"},
 			},
 			wantStdout: "args: molecule -v create -s default\n" +
-				"ANSIBLE_LOG_PATH=/tmp/molecule-x-0create\n",
+				"ANSIBLE_LOG_PATH=/tmp/molecule-x-0create\n" +
+				"ANSIBLE_ROLES_PATH=\n",
 		},
 		{
 			name:    "non zero exit propagates error",
 			args:    args{ctx: context.Background(), bin: failBin, logPath: "/tmp/x"},
 			wantErr: true,
 		},
+		{
+			name: "prepends roles path when existing is empty",
+			args: args{
+				ctx: context.Background(), bin: okBin, logPath: "/tmp/log",
+				rolesPath: "/bar",
+			},
+			wantStdout: "args: \n" +
+				"ANSIBLE_LOG_PATH=/tmp/log\n" +
+				"ANSIBLE_ROLES_PATH=/bar\n",
+		},
+		{
+			name: "prepends roles path to existing",
+			args: args{
+				ctx: context.Background(), bin: okBin, logPath: "/tmp/log",
+				rolesPath: "/bar",
+			},
+			envRoles: "/foo",
+			wantStdout: "args: \n" +
+				"ANSIBLE_LOG_PATH=/tmp/log\n" +
+				"ANSIBLE_ROLES_PATH=/bar:/foo\n",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("ANSIBLE_ROLES_PATH", tt.envRoles)
 			stdout := &bytes.Buffer{}
 			stderr := &bytes.Buffer{}
 			err := runMolecule(
-				tt.args.ctx, tt.args.bin, stdout, stderr, tt.args.logPath, tt.args.args...)
+				tt.args.ctx, tt.args.bin, stdout, stderr, tt.args.logPath,
+				tt.args.rolesPath, tt.args.args...)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("runMolecule() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -916,6 +981,26 @@ func Test_runMolecule(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_uuidV7(t *testing.T) {
+	t.Run("returns a uuid string", func(t *testing.T) {
+		got, err := uuidV7()
+		if err != nil {
+			t.Fatalf("uuidV7() error = %v", err)
+		}
+		if _, err := uuid.Parse(got); err != nil {
+			t.Errorf("uuidV7() = %q, not a uuid: %v", got, err)
+		}
+	})
+	t.Run("rand failure propagates", func(t *testing.T) {
+		uuid.SetRand(bytes.NewReader(nil))
+		defer uuid.SetRand(nil)
+		_, err := uuidV7()
+		if err == nil {
+			t.Error("expected error when rand.Reader fails")
+		}
+	})
 }
 
 // writeFakeGit creates an executable shell script mimicking `git clone`: it
