@@ -22,8 +22,9 @@ permissions:
   pull-requests: write
   issues: write
 jobs:
-  ai-review:
+  review-opencode:
     runs-on: ubuntu-latest
+    name: review opencode
     steps:
       - uses: actions/checkout@v7
         with:
@@ -31,7 +32,7 @@ jobs:
           fetch-tags: true
           submodules: recursive
           persist-credentials: false
-      - name: Run AI review
+      - name: Review by opencode agent
         # jscpd:ignore-end
         uses: megalomania428/github-actions/review-opencode@master
         with:
