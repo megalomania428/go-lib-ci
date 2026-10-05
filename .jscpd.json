@@ -1,5 +1,0 @@
-{
-  "threshold": 0,
-  "reporters": ["html", "markdown"],
-  "ignore": ["**/*_test.go"]
-}

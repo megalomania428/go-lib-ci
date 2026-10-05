@@ -1,7 +1,0 @@
----
-rules:
-  unpinned-uses:
-    ignore:
-      - ai-review.yaml
-      - ai-opeview.yaml
-      - lib-test.yaml

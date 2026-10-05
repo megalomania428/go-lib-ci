@@ -1,3 +1,4 @@
+# cspell:ignore pycache
 /deps/
 *.pyc
 __pycache__/
