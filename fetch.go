@@ -1,6 +1,6 @@
 // Package ci is documented in doc.go.
 // cspell:ignore badurl copyerr defaultdest isdir alives noprogress
-// cspell:ignore rawhex stallsig syncfail
+// cspell:ignore rawhex stallsig syncfail unparseable
 package ci
 
 import (
