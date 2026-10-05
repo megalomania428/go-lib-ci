@@ -1,6 +1,9 @@
 # Golang library for CI/CD workflows
 
-[![lib-test](https://github.com/megalomania428/go-lib-ci/actions/workflows/lib-test.yaml/badge.svg)](https://github.com/megalomania428/go-lib-ci/actions/workflows/lib-test.yaml)
+<!-- cspell:ignore LZMA strconv Fprintln Getenv Println -->
+<!-- markdownlint-disable MD010 MD013 -->
+
+[![lib-test](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml/badge.svg)](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml)
 
 ## Environment helpers
 
@@ -82,6 +85,32 @@ bar.Finish(err)
 When the stream size is not known yet at bar creation time, pass `Total: -1`
 and call `SetTotal` once it becomes available — this is how `FetchURL` covers
 connect/TLS with a wave animation before `Content-Length` arrives.
+
+## Functional-option APIs
+
+New APIs accept `ctx context.Context` first and optional `With…` functions for all remaining settings. Constructors do not need a context. Missing required options wrap `ErrMissingOption`, allowing `errors.Is(err, ci.ErrMissingOption)`. Existing positional APIs are unchanged.
+
+### Commands and Git
+
+`RunCommand` inherits the environment and supports working directory, additional environment entries and input/output streams. `CommandOutput` captures stdout, regardless of `WithCommandStdout`, while stderr remains separate. Errors include the executable and exit status, but omit arguments to avoid exposing credentials. External executable names are overridable, including Git, patch and archive tools.
+
+`GitClone` pins a tag or branch, optionally using depth, bare mode and a partial-clone filter. `GitChangedFiles` supports merge-base comparisons and disables rename detection so moves include both old and new paths. `GitPreviousTag` finds the nearest matching tag reachable from `Ref`, excluding `Ref` itself with `git describe --tags --abbrev=0 --match <Match> --exclude <Ref> --end-of-options <Ref>`, where the `refs/tags/` prefix is stripped from the `--exclude` value because Git matches it against short tag names; another matching tag on the same commit is eligible. No matching tag returns an empty string without an error; other Git failures remain errors. `GitDiff`, `GitLog` and `GitShow` accept path restrictions. Filenames containing whitespace are retained by NUL-delimited changed-file parsing.
+
+### Patches and archives
+
+`ApplyPatches` applies regular `.diff` and `.patch` files in directory order and lexical filename order with `patch --batch --forward`. Missing directories and already applied patches are errors; empty directories are allowed. Returned filenames record successful applications before an error.
+
+`ArchiveTarXz` uses `tar` with `xz -T0 -9e`; `Archive7z` uses LZMA2 at maximum compression. Both remove the previous archive first and store the source by its base name, not its absolute path. `ArchiveTarXz` rejects output paths inside the source before removing an existing archive. Archive programs and system packages must already be installed; installation belongs to the caller, for example through `EnsurePackages`.
+
+### GitHub releases
+
+`NewGitHubClient` uses `net/http` with GitHub API headers and configurable REST/upload endpoints, HTTP client, backoff, progress and stderr. `FindRelease` returns nil for an absent published release, or the lowest-ID matching draft across all pages. `EnsureRelease` updates explicitly supplied, differing name/body fields (including empty strings), preserves omitted fields on existing releases and leaves them out when creating a new one, handles a published-release create race and converges concurrent draft creators by deleting their newer duplicate. `ListAssets` follows Link pagination. `UploadAsset` optionally deletes only matching names, reports reversed upload progress and reopens the file on rate-limit responses (429, or 403 with `Retry-After` or exhausted quota) and connection failures. Other transport failures, HTTP 408/5xx and unreadable upload responses stop without retrying because the server may already have accepted the asset. With `WithAssetReplace(true)`, a 422 `already_exists` response repeats matching-name cleanup and upload, for at most three upload cycles; without replacement it remains an error. `DeleteAsset` and `DeleteRelease` tolerate 404. Errors retain `*GitHubAPIError` for `errors.As`.
+
+Network failures, 5xx, 408, 429 and rate-limit 403 responses use `Retry`, honoring `Retry-After` and `X-RateLimit-Reset`; other HTTP failures stop immediately. POST requests (release creation and uploads) retry only connection failures and rate limits, because after other transport failures, 408/5xx or unreadable responses GitHub may already have applied them. The token requires appropriate repository permissions. A draft's unrelated assets are never automatically removed.
+
+### Telegram Rich Messages
+
+`NewTelegramClient` uses `github.com/go-telegram/bot` with getMe disabled. `SendRichPost` sends one Rich Markdown post with documents referenced at the end through `tg://document?id=` and uploaded through multipart `attach://` parts. Documents are reopened on every retry and duplicate base names get distinct part names. The caller enforces file/media/text limits and decides whether to retry permanent API rejection with fallback text. Connection failures and 429 use `Retry`, honoring Telegram `retry_after`; other network, 5xx and response errors stop because the post may already be delivered. API errors retain `*TelegramAPIError`. Server URL and HTTP client are overridable for mock-server tests.
 
 ## Make release
 
