@@ -116,13 +116,13 @@ Network failures, 5xx, 408, 429 and rate-limit 403 responses use `Retry`, honori
 
 - clone me:
 
-```bash
-git clone --recursive git@github.com:megalomania428/go-lib-ci.git go-lib-ci
-```
+  ```bash
+  git clone --recursive git@github.com:megalomania428/go-lib-ci.git go-lib-ci
+  ```
 
 - make tag and send to release:
 
-```bash
-git checkout master && git pull
-git tag -fm $(git branch --sho) v1.0.5 && git push --force origin $(git describe)
-```
+  ```bash
+  git checkout master && git pull
+  git tag -fm $(git branch --sho) v1.0.6 && git push --force origin $(git describe)
+  ```
