@@ -55,7 +55,7 @@ permissions:
   issues: write
 jobs:
   review-simple:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: review simple
     steps:
       - uses: actions/checkout@v7

@@ -17,7 +17,7 @@ jobs:
   default:
     name: t
     timeout-minutes: 33
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -62,7 +62,7 @@ jobs:
   linters:
     name: linters
     timeout-minutes: 11
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -78,11 +78,11 @@ jobs:
           env.BRA }}/sources/linters-ubuntu-22_04/check-dir.sh | bash
           curl -fsL \
           https://raw.githubusercontent.com/raven428/container-images/refs/heads/${{
-          env.BRA }}/sources/ansible-ubuntu/check-dir.sh | bash
+          env.BRA }}/_shared/install/ansible/check-dir.sh | bash
   MegaLinter:
     name: MegaLinter
     timeout-minutes: 11
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -96,7 +96,7 @@ jobs:
   all-green:
     name: all green
     timeout-minutes: 5
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs:
       - default
       - linters
