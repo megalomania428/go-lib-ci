@@ -23,7 +23,7 @@ permissions:
   issues: write
 jobs:
   review-opencode:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     name: review opencode
     steps:
       - uses: actions/checkout@v7
