@@ -1,6 +1,6 @@
 module github.com/megalomania428/go-lib-ci
 
-go 1.25.13
+go 1.26.9
 
 require (
 	github.com/go-telegram/bot v1.27.0
