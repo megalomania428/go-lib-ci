@@ -24,27 +24,27 @@
   "dictionaryDefinitions": [
     {
       "name": "ru-ru",
-      "path": "/node-deps/node_modules/@cspell/dict-ru_ru/ru_ru.trie.gz",
+      "path": "/node-cspell/node_modules/@cspell/dict-ru_ru/ru_ru.trie.gz",
       "description": "Russian Dictionary (Combined)"
     },
     {
       "name": "softwareTerms",
-      "path": "/node-deps/node_modules/@cspell/dict-software-terms/dict/softwareTerms.txt.gz",
+      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/softwareTerms.txt.gz",
       "description": "Software terms dictionary"
     },
     {
       "name": "software-tools",
-      "path": "/node-deps/node_modules/@cspell/dict-software-terms/dict/software-tools.txt",
+      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/software-tools.txt",
       "description": "Software tools dictionary"
     },
     {
       "name": "networking-terms",
-      "path": "/node-deps/node_modules/@cspell/dict-software-terms/dict/networkingTerms.txt",
+      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/networkingTerms.txt",
       "description": "Software networking terms dictionary"
     },
     {
       "name": "computing-acronyms",
-      "path": "/node-deps/node_modules/@cspell/dict-software-terms/dict/computing-acronyms.txt",
+      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/computing-acronyms.txt",
       "description": "Common acronyms related to computing"
     }
   ],
