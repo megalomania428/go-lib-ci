@@ -90,8 +90,8 @@ jobs:
           submodules: recursive
           persist-credentials: false
       - name: Run MegaLinter
-        with:
-          override_dir: .megalinter/configs
+        env:
+          OVERRIDE_DIR: .megalinter/configs
         uses: megalomania428/github-actions/megalinter@master
   all-green:
     name: all green
