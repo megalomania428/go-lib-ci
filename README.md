@@ -1,6 +1,6 @@
 # Golang library for CI/CD workflows
 
-<!-- cspell:ignore LZMA strconv Fprintln Getenv Println -->
+<!-- cspell:ignore lzma strconv fprintln getenv println ints unparseable dpkg Errorf -->
 <!-- markdownlint-disable MD010 MD013 -->
 
 [![lib-test](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml/badge.svg)](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml)
