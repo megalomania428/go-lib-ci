@@ -101,13 +101,10 @@ jobs:
       - default
       - linters
       - MegaLinter
-    if: github.event_name == 'pull_request'
-    permissions:
-      checks: read
+    if: ${{ always() && github.event_name == 'pull_request' }}
     steps:
-      - name: waiting for checks success
-        uses: poseidon/wait-for-status-checks@v0.6.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: all green
-          timeout: 111s
+      - name: Check dependencies
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")'
