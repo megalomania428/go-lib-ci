@@ -1,60 +1,14 @@
 {
   "version": "0.2",
-  "language": "en,ru",
+  "import": [".cspell-action.json"],
   "words": [
     "covermode",
     "coverprofile",
-    "devskim",
     "dpkg",
     "errorf",
     "ghrel",
     "ghrelease",
     "ints",
-    "lycheeignore",
-    "opencode",
-    "opeview",
-    "pideview",
-    "pylintrc",
-    "snomcy",
-    "unparseable",
-    "wripy",
-    "xhigh",
-    "zizmor"
-  ],
-  "dictionaryDefinitions": [
-    {
-      "name": "ru-ru",
-      "path": "/node-cspell/node_modules/@cspell/dict-ru_ru/ru_ru.trie.gz",
-      "description": "Russian Dictionary (Combined)"
-    },
-    {
-      "name": "softwareTerms",
-      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/softwareTerms.txt.gz",
-      "description": "Software terms dictionary"
-    },
-    {
-      "name": "software-tools",
-      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/software-tools.txt",
-      "description": "Software tools dictionary"
-    },
-    {
-      "name": "networking-terms",
-      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/networkingTerms.txt",
-      "description": "Software networking terms dictionary"
-    },
-    {
-      "name": "computing-acronyms",
-      "path": "/node-cspell/node_modules/@cspell/dict-software-terms/dict/computing-acronyms.txt",
-      "description": "Common acronyms related to computing"
-    }
-  ],
-  "dictionaries": [
-    "ru-ru",
-    "softwareTerms",
-    "software-tools",
-    "networking-terms",
-    "computing-acronyms"
-  ],
-  "ignorePaths": ["**/go.mod", "**/go.sum"],
-  "enabled": true
+    "unparseable"
+  ]
 }
