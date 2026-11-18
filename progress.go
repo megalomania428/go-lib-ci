@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,19 +39,69 @@ var ciSinusTable = func() [ciWaveSineSteps]int {
 	return t
 }()
 
+// ProgressElement is one element of the progress line. Elements are always
+// rendered in the order of the declarations below, whatever order they are
+// selected in. The examples below are the CI renderer output; in a terminal
+// mpb draws its own form of each element, for example "7.26 MiB/s".
+type ProgressElement int
+
+const (
+	// ProgressElementBytes is the byte counter, "109M/112M"; while the size
+	// is unknown the CI renderer shows only the transferred bytes, "109M".
+	ProgressElementBytes ProgressElement = iota
+	// ProgressElementElapsed is the elapsed time, "0:00:01".
+	ProgressElementElapsed
+	// ProgressElementSpeed is the transfer speed, "[78.7M/s]".
+	ProgressElementSpeed
+	// ProgressElementBar is the bar, "[<====]"; while the size is unknown
+	// the CI renderer draws a wave instead.
+	ProgressElementBar
+	// ProgressElementPercent is the completed percentage, "97%"; the CI
+	// renderer hides it while the size is unknown.
+	ProgressElementPercent
+	// ProgressElementETA is the remaining time, "ETA 0:00:00"; the CI
+	// renderer hides it while the size is unknown and once the transfer is
+	// complete.
+	ProgressElementETA
+)
+
+// progressElements is a set of ProgressElement values, one bit per element.
+type progressElements uint8
+
+// progressAllElements is the full progress line, used when no set is given.
+const progressAllElements progressElements = 1<<(ProgressElementETA+1) - 1
+
+// newProgressElements builds a set from elems, ignoring duplicates and values
+// outside the declared ProgressElement constants.
+func newProgressElements(elems []ProgressElement) progressElements {
+	var s progressElements
+	for _, e := range elems {
+		if e >= ProgressElementBytes && e <= ProgressElementETA {
+			s |= 1 << e
+		}
+	}
+	return s
+}
+
+func (s progressElements) has(e ProgressElement) bool { return s&(1<<e) != 0 }
+
 // ciRenderer prints a progress bar with one frame per line, so that CI log
 // viewers that do not honor carriage returns keep every frame in the log as
 // a vertical trail.
 //
 // While no bytes have arrived yet it prints wave frames (a moving "-=O=-"
 // marker plus four "#" characters walking along a sine curve), matching the
-// look of curl's fly() in tool_cb_prg.c. Once the first byte is received it
-// switches to a pv-style line like:
+// look of curl's fly() in tool_cb_prg.c. Once the first byte is received and
+// the size is known it switches to a pv-style line built from the selected
+// elements, the full one being:
 //
-//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------] 30% ETA 0:05:58
+//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------]  30% ETA 0:05:58
 //
 // A new line is printed whenever the progress bar advances by at least one
-// character or once per second, whichever comes first.
+// character (without the bar element: whenever the integer percentage
+// changes) or once per second, whichever comes first. While the size is
+// unknown it prints the selected bytes, elapsed time and speed followed by a
+// wave in place of the bar, once per second.
 type ciRenderer struct {
 	out       io.Writer
 	total     atomic.Int64
@@ -62,8 +113,14 @@ type ciRenderer struct {
 	tick      int
 	barPos    int
 	barMove   int
+	// lastBar is the throttling step of the last printed pv-style line: the
+	// filled bar cells, or the integer percentage without the bar element.
 	lastBar   int
 	lastPrint time.Time
+	// lastCompose is when the last unknown-size line was printed.
+	lastCompose time.Time
+	// elements is the set of line elements to render, never empty.
+	elements progressElements
 	// lastPct is the last percentage actually printed by printPVIfChanged.
 	// It is used so Stop does not duplicate a 100% line and does not draw a
 	// lone 100% frame without any prior output.
@@ -86,12 +143,13 @@ type ciRenderer struct {
 
 func newCIRenderer(out io.Writer, total int64, reverse bool) *ciRenderer {
 	r := &ciRenderer{
-		out:     out,
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
-		barMove: 1,
-		tick:    150,
-		reverse: reverse,
+		out:      out,
+		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
+		barMove:  1,
+		tick:     150,
+		reverse:  reverse,
+		elements: progressAllElements,
 	}
 	r.total.Store(total)
 	return r
@@ -135,8 +193,9 @@ func (r *ciRenderer) Stop() {
 	cur := r.counter.Load()
 	if total > 0 && cur > 0 &&
 		!r.lastPrint.IsZero() && r.lastPct < 100 {
-		final := r.renderFinalLine(cur, total)
-		fmt.Fprintln(r.out, final)
+		if final := r.renderFinalLine(cur, total); final != "" {
+			fmt.Fprintln(r.out, final)
+		}
 	}
 	r.finalPrinted = true
 }
@@ -170,13 +229,13 @@ func (r *ciRenderer) frame() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if cur == 0 {
-		fmt.Fprintln(r.out, r.renderWaveLine(true))
+		fmt.Fprintln(r.out, r.renderWaveLine(ciBarWidth, true))
 		return
 	}
 	r.updateSpeed(cur, now)
 	total := r.total.Load()
 	if total <= 0 {
-		fmt.Fprintln(r.out, r.renderWaveLineWithBytes(cur))
+		r.printComposeIfDue(cur, now)
 		return
 	}
 	r.printPVIfChanged(cur, total, now)
@@ -209,18 +268,66 @@ func (r *ciRenderer) updateSpeed(cur int64, now time.Time) {
 	r.speedLastN = cur
 }
 
+// printComposeIfDue prints the unknown-size line at most once per second.
+// A line left empty by the selected elements is not printed.
+func (r *ciRenderer) printComposeIfDue(cur int64, now time.Time) {
+	if !r.lastCompose.IsZero() && now.Sub(r.lastCompose) < time.Second {
+		return
+	}
+	line := r.composeLine(cur, now)
+	if line == "" {
+		return
+	}
+	fmt.Fprintln(r.out, line)
+	r.lastCompose = now
+}
+
+// composeLine renders the unknown-size line: the selected bytes (only the
+// transferred count), elapsed time and speed, then a bare wave filling the
+// rest of the ciBarWidth columns when the bar element is selected.
+func (r *ciRenderer) composeLine(cur int64, now time.Time) string {
+	parts := r.headParts(humanBytes(cur, true), now)
+	if !r.elements.has(ProgressElementBar) {
+		return strings.Join(parts, " ")
+	}
+	w := ciBarWidth
+	for _, p := range parts {
+		w -= len(p) + 1
+	}
+	return strings.Join(append(parts, r.renderWaveLine(w, true)), " ")
+}
+
+// headParts returns the selected elements that precede the bar: bytes, then
+// elapsed time, then speed.
+func (r *ciRenderer) headParts(bytes string, now time.Time) []string {
+	var parts []string
+	if r.elements.has(ProgressElementBytes) {
+		parts = append(parts, bytes)
+	}
+	if r.elements.has(ProgressElementElapsed) {
+		parts = append(parts, formatDuration(now.Sub(r.startedAt)))
+	}
+	if r.elements.has(ProgressElementSpeed) {
+		parts = append(parts, "["+humanBytes(int64(r.speedEWMA), true)+"/s]")
+	}
+	return parts
+}
+
 func (r *ciRenderer) printPVIfChanged(cur, total int64, now time.Time) {
-	line, bar, pct := r.pvLine(cur, total, now)
+	line, step, pct := r.pvLine(cur, total, now)
 	sinceLast := now.Sub(r.lastPrint)
-	changed := r.lastPrint.IsZero() || bar != r.lastBar || sinceLast >= time.Second
+	changed := r.lastPrint.IsZero() || step != r.lastBar || sinceLast >= time.Second
 	if !changed {
 		return
 	}
 	if pct >= 100 && (r.lastPrint.IsZero() || r.lastPct >= 100) {
 		return
 	}
+	if line == "" {
+		return
+	}
 	fmt.Fprintln(r.out, line)
-	r.lastBar = bar
+	r.lastBar = step
 	r.lastPct = pct
 	r.lastPrint = now
 }
@@ -230,34 +337,45 @@ func (r *ciRenderer) renderFinalLine(cur, total int64) string {
 	return line
 }
 
-// pvLine renders a pv-style progress line:
+// pvLine renders a pv-style progress line from the selected elements joined
+// by single spaces, the full one being:
 //
-//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------] 30% ETA 0:05:58
+//	3.0M/20.0M 0:01:06 [18.6K/s] [====>-----------]  30% ETA 0:05:58
 //
-// It returns the line, the number of filled bar cells (used for update
-// throttling) and the percent value. When r.reverse is true the filled
-// region grows from the right edge of the bar instead of the left.
+// The bar takes the columns left to ciBarWidth by the other elements, ETA is
+// omitted once cur reaches total, and an empty selection yields "". It
+// returns the line, the throttling step (the number of filled bar cells, or
+// the integer percentage without the bar element) and the percent value.
+// When r.reverse is true the filled region grows from the right edge of the
+// bar instead of the left.
 func (r *ciRenderer) pvLine(cur, total int64, now time.Time) (string, int, float64) {
 	if cur > total {
 		cur = total
 	}
 	frac := float64(cur) / float64(total)
 	pct := frac * 100.0
-	elapsed := now.Sub(r.startedAt)
-	var eta time.Duration
-	if r.speedEWMA > 1 && cur < total {
-		eta = time.Duration(float64(total-cur)/r.speedEWMA) * time.Second
+	head := r.headParts(humanBytes(cur, true)+"/"+humanBytes(total, true), now)
+	var tail []string
+	if r.elements.has(ProgressElementPercent) {
+		tail = append(tail, fmt.Sprintf("%3.0f%%", pct))
 	}
-	prefix := fmt.Sprintf(
-		"%s/%s %s [%s/s] ",
-		humanBytes(cur, true), humanBytes(total, true),
-		formatDuration(elapsed), humanBytes(int64(r.speedEWMA), true),
-	)
-	suffix := fmt.Sprintf(" %3.0f%% ETA %s", pct, formatDuration(eta))
-	if cur >= total {
-		suffix = fmt.Sprintf(" %3.0f%%", pct)
+	if r.elements.has(ProgressElementETA) && cur < total {
+		var eta time.Duration
+		if r.speedEWMA > 1 {
+			eta = time.Duration(float64(total-cur)/r.speedEWMA) * time.Second
+		}
+		tail = append(tail, "ETA "+formatDuration(eta))
 	}
-	barw := ciBarWidth - len(prefix) - len(suffix) - 2
+	if !r.elements.has(ProgressElementBar) {
+		return strings.Join(append(head, tail...), " "), int(pct), pct
+	}
+	barw := ciBarWidth - 2
+	for _, p := range head {
+		barw -= len(p) + 1
+	}
+	for _, p := range tail {
+		barw -= len(p) + 1
+	}
 	filled := int(float64(barw) * frac)
 	bar := make([]byte, barw)
 	if r.reverse {
@@ -284,13 +402,14 @@ func (r *ciRenderer) pvLine(cur, total int64, now time.Time) (string, int, float
 			bar[i] = '-'
 		}
 	}
-	return prefix + "[" + string(bar) + "]" + suffix, filled, pct
+	head = append(head, "["+string(bar)+"]")
+	return strings.Join(append(head, tail...), " "), filled, pct
 }
 
 // humanBytes renders a byte count as a human-readable string. When short is
 // true the output uses compact pv-style single-letter suffixes without spaces
 // (e.g. "3.0M"). When short is false it uses IEC binary suffixes with spaces
-// (e.g. "3.0 MiB"), as used by curl's wave-line display.
+// (e.g. "3.0 MiB").
 func humanBytes(n int64, short bool) string {
 	if n < 0 {
 		n = 0
@@ -332,15 +451,18 @@ func formatDuration(d time.Duration) string {
 
 // renderWaveLine mirrors the fly() function from curl's tool_cb_prg.c. The
 // "-=O=-" marker walks left-to-right, then right-to-left, while four "#"
-// characters ride four sine waves shifted by 5 ticks each. The tick counter
-// is advanced by 2 per frame, exactly like curl.
-func (r *ciRenderer) renderWaveLine(advance bool) string {
-	w := ciBarWidth
+// characters ride four sine waves shifted by 5 ticks each across w columns.
+// The tick counter is advanced by 2 per frame, exactly like curl.
+func (r *ciRenderer) renderWaveLine(w int, advance bool) string {
 	buf := make([]byte, w)
 	for i := 0; i < w; i++ {
 		buf[i] = ' '
 	}
 	check := w - 2
+	// A narrower line than the previous frame pulls the marker back inside.
+	if maxPos := w - ciBarMarkerLen - 1; maxPos >= 0 && r.barPos > maxPos {
+		r.barPos, r.barMove = maxPos, -1
+	}
 	if r.barPos >= 0 && r.barPos+ciBarMarkerLen <= w {
 		copy(buf[r.barPos:], "-=O=-")
 	}
@@ -367,19 +489,6 @@ func (r *ciRenderer) renderWaveLine(advance bool) string {
 		}
 	}
 	return string(buf)
-}
-
-func (r *ciRenderer) renderWaveLineWithBytes(cur int64) string {
-	line := []byte(r.renderWaveLine(true))
-	// Right-align the human-readable byte count inside the fixed-width buffer
-	// by overwriting the trailing bytes, preserving a single space separator.
-	suffix := humanBytes(cur, false)
-	pos := len(line) - len(suffix)
-	if pos > 0 {
-		line[pos-1] = ' '
-		copy(line[pos:], suffix)
-	}
-	return string(line)
 }
 
 type countingReader struct {
@@ -417,7 +526,7 @@ type ProgressOptions struct {
 	Name string
 	// Total is the known full size of the stream in bytes. 0 or a negative
 	// value leaves the size unknown: the CI renderer shows the wave
-	// indicator and mpb an indeterminate bar, without percentages.
+	// indicator without percentage and ETA, and mpb an indeterminate bar.
 	Total int64
 	// Stderr is where the bar is drawn. Defaults to os.Stderr.
 	Stderr io.Writer
@@ -435,9 +544,78 @@ type ProgressOptions struct {
 	RefreshRate time.Duration
 }
 
+// ProgressOption configures NewProgress. A missing option keeps the default
+// of the matching zero ProgressOptions field; without WithProgressElements
+// the full progress line is rendered.
+type ProgressOption func(*progressConfig)
+
+type progressConfig struct {
+	opts ProgressOptions
+	// elements is the selected set, used only when custom is true.
+	elements progressElements
+	custom   bool
+}
+
+// WithProgressName sets the name printed before the bar in mpb mode.
+func WithProgressName(name string) ProgressOption {
+	return func(c *progressConfig) { c.opts.Name = name }
+}
+
+// WithProgressTotal sets the known full size in bytes; 0 or a negative value
+// leaves the size unknown.
+func WithProgressTotal(total int64) ProgressOption {
+	return func(c *progressConfig) { c.opts.Total = total }
+}
+
+// WithProgressStderr sets where the bar is drawn, defaulting to os.Stderr.
+func WithProgressStderr(w io.Writer) ProgressOption {
+	return func(c *progressConfig) { c.opts.Stderr = w }
+}
+
+// WithProgressCIMode forces the line-per-frame CI renderer (true) or mpb
+// (false) instead of auto-detection via term.IsTerminal. mpb draws nothing
+// into a writer that is not a terminal.
+func WithProgressCIMode(on bool) ProgressOption {
+	return func(c *progressConfig) { c.opts.CIMode = &on }
+}
+
+// WithProgressNoProgressBar disables rendering entirely.
+func WithProgressNoProgressBar(on bool) ProgressOption {
+	return func(c *progressConfig) { c.opts.NoProgressBar = on }
+}
+
+// WithProgressReverse fills the bar visually right-to-left, as for uploads.
+func WithProgressReverse(on bool) ProgressOption {
+	return func(c *progressConfig) { c.opts.Reverse = on }
+}
+
+// WithProgressRefreshRate overrides the mpb redraw period; <= 0 means the
+// default. The CI renderer always refreshes at its own fixed period.
+func WithProgressRefreshRate(d time.Duration) ProgressOption {
+	return func(c *progressConfig) { c.opts.RefreshRate = d }
+}
+
+// WithProgressElements selects the elements of the progress line. The order
+// of elems and duplicates do not matter, unknown values are ignored, and no
+// elements at all render nothing, like WithProgressNoProgressBar(true). When
+// given several times, the last one wins.
+func WithProgressElements(elems ...ProgressElement) ProgressOption {
+	return func(c *progressConfig) {
+		c.elements, c.custom = newProgressElements(elems), true
+	}
+}
+
+func newProgressConfig(opts []ProgressOption) progressConfig {
+	var c progressConfig
+	for _, opt := range opts {
+		opt(&c)
+	}
+	return c
+}
+
 // ProgressBar is a progress bar controller living on top of an arbitrary
-// stream. An instance is created by NewProgressBar and is no longer used
-// after Finish.
+// stream. An instance is created by NewProgress or NewProgressBar and is no
+// longer used after Finish.
 type ProgressBar interface {
 	// WrapReader returns an io.ReadCloser that adds the number of bytes read
 	// to the bar's counter on every Read. Close closes the wrapped reader
@@ -454,7 +632,7 @@ type ProgressBar interface {
 	// SetTotal updates the expected size after start (e.g. when
 	// Content-Length arrives only after the bar has already been drawn).
 	// Non-positive values mean the size is unknown: the CI renderer
-	// switches to the wave animation, the mpb bar keeps its current total.
+	// switches to its unknown-size line, the mpb bar keeps its current total.
 	SetTotal(int64)
 	// Finish closes the bar, printing the final line (in CI mode) or
 	// finishing mpb.Progress. err is passed so the mpb bar can render an
@@ -547,6 +725,10 @@ func (p *ciProgressBar) Finish(error) { p.r.Stop() }
 type mpbProgressBar struct {
 	p   *mpb.Progress
 	bar *mpb.Bar
+	// mu guards lastIncr, the time of the previous increment (initially the
+	// bar creation time) shared by AddBytes and WrapWriter.
+	mu       sync.Mutex
+	lastIncr time.Time
 	// indeterminate records whether the bar was constructed with total <= 0
 	// (size unknown ahead of time). mpb only arms triggerComplete for bars
 	// built with total > 0, so such a bar's Completed() is always false and
@@ -556,13 +738,13 @@ type mpbProgressBar struct {
 
 type mpbCountingWriteCloser struct {
 	w   io.Writer
-	bar *mpb.Bar
+	bar *mpbProgressBar
 }
 
 func (c *mpbCountingWriteCloser) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	if n > 0 {
-		c.bar.IncrBy(n)
+		c.bar.incr(int64(n))
 	}
 	return n, err
 }
@@ -574,21 +756,28 @@ func (m *mpbProgressBar) WrapReader(r io.Reader) io.ReadCloser {
 }
 
 func (m *mpbProgressBar) WrapWriter(w io.Writer) io.WriteCloser {
-	return &mpbCountingWriteCloser{w: w, bar: m.bar}
+	return &mpbCountingWriteCloser{w: w, bar: m}
 }
 
-// AddBytes increments the bar counter by n bytes. n is chunked to
-// math.MaxInt32 per call so a single large increment cannot overflow int on
-// 32-bit platforms, where int is only 32 bits wide.
+// AddBytes increments the bar counter by n bytes; n <= 0 is ignored.
 func (m *mpbProgressBar) AddBytes(n int64) {
 	if n <= 0 {
 		return
 	}
-	for n > math.MaxInt32 {
-		m.bar.IncrBy(math.MaxInt32)
-		n -= math.MaxInt32
-	}
-	m.bar.IncrBy(int(n))
+	m.incr(n)
+}
+
+// incr adds n bytes together with the time since the previous increment, so
+// the EWMA speed and ETA decorators receive real samples; plain IncrBy would
+// leave them at zero. The lock is held until mpb takes the sample, so
+// concurrent increments reach the EWMA in the order of their intervals.
+func (m *mpbProgressBar) incr(n int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	dur := now.Sub(m.lastIncr)
+	m.lastIncr = now
+	m.bar.EwmaIncrInt64(n, dur)
 }
 
 // SetTotal updates the bar's total, ignoring non-positive values. mpb's own
@@ -629,12 +818,34 @@ func (m *mpbProgressBar) Finish(err error) {
 // NewProgressBar assembles a ProgressBar, choosing between mpb and the CI
 // renderer by the same rules as FetchURL: if Stderr is a TTY and CIMode is
 // unset, mpb is used; otherwise the line-per-frame CI renderer is used. The
-// context stops the background render loop in both mpb and CI modes.
+// context stops the background render loop in both mpb and CI modes. It
+// renders the full progress line; NewProgress also selects its elements.
 func NewProgressBar(ctx context.Context, opts ProgressOptions) ProgressBar {
+	return newProgress(ctx, progressConfig{opts: opts})
+}
+
+// NewProgress assembles a ProgressBar like NewProgressBar, configured by
+// functional options. WithProgressElements selects the elements of the line;
+// an empty selection renders nothing.
+func NewProgress(ctx context.Context, opts ...ProgressOption) ProgressBar {
+	return newProgress(ctx, newProgressConfig(opts))
+}
+
+// mpbContainerOptions are appended to the mpb container options of every
+// bar. Tests set mpb.WithAutoRefresh() here to render into non-terminal
+// writers, which mpb otherwise leaves empty.
+var mpbContainerOptions []mpb.ContainerOption
+
+func newProgress(ctx context.Context, cfg progressConfig) ProgressBar {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if opts.NoProgressBar {
+	opts := cfg.opts
+	elements := progressAllElements
+	if cfg.custom {
+		elements = cfg.elements
+	}
+	if opts.NoProgressBar || elements == 0 {
 		return noopProgressBar{}
 	}
 	if opts.Stderr == nil {
@@ -646,33 +857,88 @@ func NewProgressBar(ctx context.Context, opts ProgressOptions) ProgressBar {
 	}
 	if useCIRenderer(opts.Stderr, opts.CIMode) {
 		r := newCIRenderer(opts.Stderr, opts.Total, opts.Reverse)
+		r.elements = elements
 		r.Start(ctx)
 		return &ciProgressBar{r: r}
 	}
-	style := mpb.BarStyle().Rbound("|")
-	if opts.Reverse {
-		style = style.Reverse()
-	}
+	createdAt := time.Now()
 	prepend := []decor.Decorator{decor.CountersKibiByte("% .2f / % .2f")}
+	appended := []decor.Decorator{
+		decor.EwmaSpeed(decor.SizeB1024(0), " % .2f", 60),
+		decor.Name(" "),
+		decor.EwmaETA(decor.ET_STYLE_GO, 60),
+	}
+	if cfg.custom {
+		prepend, appended = mpbElementDecorators(elements, createdAt)
+	}
 	if opts.Name != "" {
 		prepend = append(
 			[]decor.Decorator{decor.Name(opts.Name + " ")}, prepend...,
 		)
 	}
-	p := mpb.NewWithContext(
-		ctx,
+	p := mpb.NewWithContext(ctx, append([]mpb.ContainerOption{
 		mpb.WithOutput(opts.Stderr),
 		mpb.WithRefreshRate(refreshRate),
-	)
-	bar := p.New(
-		opts.Total,
-		style,
+	}, mpbContainerOptions...)...)
+	barOpts := []mpb.BarOption{
 		mpb.PrependDecorators(prepend...),
-		mpb.AppendDecorators(
-			decor.EwmaSpeed(decor.SizeB1024(0), " % .2f", 60),
-			decor.Name(" "),
-			decor.EwmaETA(decor.ET_STYLE_GO, 60),
-		),
-	)
-	return &mpbProgressBar{p: p, bar: bar, indeterminate: opts.Total <= 0}
+		mpb.AppendDecorators(appended...),
+	}
+	filler := mpb.NopStyle()
+	if elements.has(ProgressElementBar) {
+		style := mpb.BarStyle().Rbound("|")
+		if opts.Reverse {
+			style = style.Reverse()
+		}
+		filler = style
+	} else {
+		barOpts = append(barOpts, mpb.BarFillerTrim())
+	}
+	bar := p.New(opts.Total, filler, barOpts...)
+	return &mpbProgressBar{
+		p: p, bar: bar, indeterminate: opts.Total <= 0, lastIncr: createdAt,
+	}
+}
+
+// mpbElementDecorators returns the decorators of the selected elements split
+// around the bar: bytes, elapsed time and speed before it, percentage and
+// ETA after it, separated by single spaces. Without the bar element all of
+// them come before the empty filler.
+func mpbElementDecorators(
+	elements progressElements, createdAt time.Time,
+) ([]decor.Decorator, []decor.Decorator) {
+	var head, tail []decor.Decorator
+	if elements.has(ProgressElementBytes) {
+		head = append(head, decor.CountersKibiByte("% .2f / % .2f"))
+	}
+	if elements.has(ProgressElementElapsed) {
+		head = append(head, decor.Any(func(decor.Statistics) string {
+			return formatDuration(time.Since(createdAt))
+		}))
+	}
+	if elements.has(ProgressElementSpeed) {
+		head = append(head, decor.EwmaSpeed(decor.SizeB1024(0), "% .2f", 60))
+	}
+	if elements.has(ProgressElementPercent) {
+		tail = append(tail, decor.NewPercentage("%d"))
+	}
+	if elements.has(ProgressElementETA) {
+		tail = append(tail, decor.EwmaETA(decor.ET_STYLE_GO, 60))
+	}
+	if !elements.has(ProgressElementBar) {
+		return spacedDecorators(append(head, tail...)), nil
+	}
+	return spacedDecorators(head), spacedDecorators(tail)
+}
+
+// spacedDecorators interleaves ds with single-space separators.
+func spacedDecorators(ds []decor.Decorator) []decor.Decorator {
+	out := make([]decor.Decorator, 0, 2*len(ds))
+	for i, d := range ds {
+		if i > 0 {
+			out = append(out, decor.Name(" "))
+		}
+		out = append(out, d)
+	}
+	return out
 }

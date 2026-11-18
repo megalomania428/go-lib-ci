@@ -6,7 +6,22 @@
 // The progress bar used internally by FetchURL is also available as a
 // public NewProgressBar constructor, so callers can wrap an arbitrary
 // io.Reader or io.Writer with the same curl-like rendering outside of a
-// download, for example to show upload progress.
+// download, for example to show upload progress. NewProgress builds it from
+// functional options, and WithProgressElements selects any subset of the
+// progress line elements, down to none:
+//
+//	bar := ci.NewProgress(ctx,
+//		ci.WithProgressTotal(size),
+//		ci.WithProgressElements(
+//			ci.ProgressElementElapsed, ci.ProgressElementPercent, ci.ProgressElementETA,
+//		),
+//	)
+//	req.Body = bar.WrapReader(body)
+//	resp, err := client.Do(req)
+//	if err == nil {
+//		resp.Body.Close()
+//	}
+//	bar.Finish(err)
 //
 // Functional-option APIs provide context-aware command execution, Git helpers,
 // ordered patch application, tar/xz and LZMA2 archives, GitHub release publishing

@@ -86,6 +86,28 @@ When the stream size is not known yet at bar creation time, pass `Total: -1`
 and call `SetTotal` once it becomes available — this is how `FetchURL` covers
 connect/TLS with a wave animation before `Content-Length` arrives.
 
+### Progress line elements
+
+`NewProgress` builds the same bar from functional options: `WithProgressName`, `WithProgressTotal`, `WithProgressStderr`, `WithProgressCIMode`, `WithProgressNoProgressBar`, `WithProgressReverse` and `WithProgressRefreshRate` mirror the `ProgressOptions` fields, and `WithProgressElements` selects any subset of `ProgressElementBytes`, `ProgressElementElapsed`, `ProgressElementSpeed`, `ProgressElementBar`, `ProgressElementPercent` and `ProgressElementETA`. Elements are always drawn in this order; duplicates and unknown values are ignored, the last `WithProgressElements` wins, and an empty set draws nothing, like `NoProgressBar`. Without `WithProgressElements` the full line is drawn, exactly as by `NewProgressBar`.
+
+```go
+bar := ci.NewProgress(ctx,
+  ci.WithProgressTotal(size),
+  ci.WithProgressReverse(true),
+  ci.WithProgressElements(
+    ci.ProgressElementElapsed, ci.ProgressElementPercent, ci.ProgressElementETA,
+  ),
+)
+req.Body = bar.WrapReader(body)
+resp, err := client.Do(req)
+if err == nil {
+  resp.Body.Close()
+}
+bar.Finish(err)
+```
+
+In CI logs this prints lines like `0:00:01__97% ETA 0:00:00`: the percentage keeps its three-column padding and the bar, when selected, takes the rest of the 79 columns. Before the first bytes arrive, a wave alone is drawn on every frame for any non-empty set of elements, even if only the percentage and/or ETA are selected. After the first bytes arrive, while the size stays unknown, the percentage and ETA are hidden, the byte counter shows only the transferred bytes, the bar becomes a wave and a line is printed once per second; in this period nothing is printed when no selected element remains. In a terminal only the decorators of the selected elements are drawn, without a bar unless `ProgressElementBar` is selected.
+
 ## Functional-option APIs
 
 New APIs accept `ctx context.Context` first and optional `With…` functions for all remaining settings. Constructors do not need a context. Missing required options wrap `ErrMissingOption`, allowing `errors.Is(err, ci.ErrMissingOption)`. Existing positional APIs are unchanged.

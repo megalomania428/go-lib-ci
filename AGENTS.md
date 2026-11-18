@@ -4,7 +4,7 @@
 
 ## Test coverage
 
-CI (`.github/workflows/lib-test.yaml`) fails the build unless total statement coverage is exactly 100%. Any change that adds or edits code must keep coverage at 100% — new branches (including early returns, error paths and loop-chunking guards like `mpbProgressBar.AddBytes`'s overflow split) need a dedicated test case, not just a happy-path call.
+CI (`.github/workflows/repo-test.yaml`) fails the build unless total statement coverage is exactly 100%. Any change that adds or edits code must keep coverage at 100% — new branches (including early returns and error paths) need a dedicated test case, not just a happy-path call.
 
 Before finishing a task, verify locally with the same invocation CI uses:
 

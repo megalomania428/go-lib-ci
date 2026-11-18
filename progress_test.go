@@ -1,4 +1,4 @@
-// cspell:ignore EWMA
+// cspell:ignore EWMA vbauerster
 package ci
 
 import (
@@ -8,10 +8,14 @@ import (
 	"io"
 	"math"
 	"os"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/vbauerster/mpb/v8"
 )
 
 func ptrBool(b bool) *bool { return &b }
@@ -278,7 +282,7 @@ func Test_mpbCountingWriteCloser_Write(t *testing.T) {
 		t.Fatal("expected *mpbProgressBar")
 	}
 	buf := &bytes.Buffer{}
-	c := &mpbCountingWriteCloser{w: buf, bar: m.bar}
+	c := &mpbCountingWriteCloser{w: buf, bar: m}
 	n, err := c.Write([]byte("hello"))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
@@ -301,7 +305,7 @@ func Test_mpbCountingWriteCloser_Close(t *testing.T) {
 	if !ok {
 		t.Fatal("expected *mpbProgressBar")
 	}
-	c := &mpbCountingWriteCloser{w: io.Discard, bar: m.bar}
+	c := &mpbCountingWriteCloser{w: io.Discard, bar: m}
 	if err := c.Close(); err != nil {
 		t.Errorf("Close() error = %v, want nil", err)
 	}
@@ -375,10 +379,9 @@ func Test_mpbProgressBar_AddBytes_NonPositive(_ *testing.T) {
 	p.Finish(errors.New("unused"))
 }
 
-// Test_mpbProgressBar_AddBytes_ChunksOverflow covers the loop that splits an
-// increment larger than math.MaxInt32 into chunks, guarding int overflow on
-// 32-bit platforms.
-func Test_mpbProgressBar_AddBytes_ChunksOverflow(_ *testing.T) {
+// Test_mpbProgressBar_AddBytes_LargeIncrement covers an increment larger
+// than math.MaxInt32, which reaches mpb as a single int64 EWMA increment.
+func Test_mpbProgressBar_AddBytes_LargeIncrement(_ *testing.T) {
 	const total = int64(math.MaxInt32) + 10
 	p := NewProgressBar(context.Background(), ProgressOptions{
 		Stderr: io.Discard,
@@ -763,7 +766,7 @@ func Test_renderWaveLine_barBoundaries(t *testing.T) {
 	defer r.mu.Unlock()
 	// Drive barPos to the right boundary and back.
 	for i := 0; i < ciBarWidth*2; i++ {
-		r.renderWaveLine(true)
+		r.renderWaveLine(ciBarWidth, true)
 		// barPos is clamped to [0, ciBarWidth-ciBarMarkerLen-1].
 		if r.barPos < 0 || r.barPos > ciBarWidth-ciBarMarkerLen-1 {
 			t.Fatalf("barPos out of range: %d at iteration %d", r.barPos, i)
@@ -937,6 +940,8 @@ func Test_ciRenderer_Stop(t *testing.T) {
 		hadPrinted   bool    // whether the renderer already printed a frame
 		wantContains string
 		wantOmit     string
+		elements     progressElements // 0 keeps the full line
+		wantEmpty    bool
 	}{
 		{name: "stop before start does not panic",
 			startFirst: false, total: 0, counter: -1, lastBar: 0},
@@ -955,6 +960,10 @@ func Test_ciRenderer_Stop(t *testing.T) {
 		{name: "stop after prior 100 percent print does not duplicate it",
 			startFirst: true, total: 1024, counter: 1024, lastBar: 10,
 			lastPct: 100, hadPrinted: true, wantOmit: "100%"},
+		{name: "stop prints nothing when the final line is empty",
+			startFirst: true, total: 1024, counter: 1024, lastBar: 10,
+			lastPct: 50, hadPrinted: true,
+			elements: elementsOf(ProgressElementETA), wantEmpty: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -968,6 +977,9 @@ func Test_ciRenderer_Stop(t *testing.T) {
 				r.startedAt = time.Now()
 				r.lastBar = tt.lastBar
 				r.lastPct = tt.lastPct
+				if tt.elements != 0 {
+					r.elements = tt.elements
+				}
 				if tt.hadPrinted {
 					r.lastPrint = time.Now()
 				}
@@ -983,6 +995,9 @@ func Test_ciRenderer_Stop(t *testing.T) {
 			}
 			if tt.wantOmit != "" && strings.Contains(got, tt.wantOmit) {
 				t.Errorf("Stop output = %q, must not contain %q", got, tt.wantOmit)
+			}
+			if tt.wantEmpty && got != "" {
+				t.Errorf("Stop output = %q, want empty", got)
 			}
 		})
 	}
@@ -1143,6 +1158,7 @@ func Test_ciRenderer_printPVIfChanged(t *testing.T) {
 		lastBar   int
 		lastPrint time.Time
 		lastPct   float64
+		elements  progressElements // 0 keeps the full line
 	}
 	type args struct {
 		cur   int64
@@ -1182,6 +1198,31 @@ func Test_ciRenderer_printPVIfChanged(t *testing.T) {
 			args:        args{cur: 1000, total: 1000, now: now},
 			wantPrinted: false,
 		},
+		{
+			name: "without bar the same integer percent is suppressed",
+			fields: fields{
+				lastBar: 50, lastPrint: now, elements: elementsOf(ProgressElementPercent),
+			},
+			args:        args{cur: 505, total: 1000, now: now},
+			wantPrinted: false,
+		},
+		{
+			name: "without bar a new integer percent prints",
+			fields: fields{
+				lastBar: 50, lastPrint: now, elements: elementsOf(ProgressElementPercent),
+			},
+			args:        args{cur: 510, total: 1000, now: now},
+			wantPrinted: true,
+		},
+		{
+			name: "empty line is not printed",
+			fields: fields{
+				lastBar: -1, lastPrint: now.Add(-2 * time.Second), lastPct: 50,
+				elements: elementsOf(ProgressElementETA),
+			},
+			args:        args{cur: 1000, total: 1000, now: now},
+			wantPrinted: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1191,6 +1232,9 @@ func Test_ciRenderer_printPVIfChanged(t *testing.T) {
 			r.lastBar = tt.fields.lastBar
 			r.lastPrint = tt.fields.lastPrint
 			r.lastPct = tt.fields.lastPct
+			if tt.fields.elements != 0 {
+				r.elements = tt.fields.elements
+			}
 			before := buf.Len()
 			r.printPVIfChanged(tt.args.cur, tt.args.total, tt.args.now)
 			printed := buf.Len() > before
@@ -1235,10 +1279,25 @@ func Test_ciRenderer_renderFinalLine(t *testing.T) {
 func Test_ciRenderer_pvLine(t *testing.T) {
 	type fields struct {
 		speedEWMA float64
+		elements  progressElements // 0 keeps the full line
+		reverse   bool
+		elapsed   time.Duration
 	}
 	type args struct {
 		cur   int64
 		total int64
+	}
+	// The examples transfer 109 of 112 MiB at 78.7 MiB/s, one second in.
+	example := func(reverse bool, elems ...ProgressElement) fields {
+		return fields{
+			speedEWMA: 82523750, elements: elementsOf(elems...), reverse: reverse,
+			elapsed: time.Second,
+		}
+	}
+	exampleArgs := args{cur: 109 << 20, total: 112 << 20}
+	all := []ProgressElement{
+		ProgressElementBytes, ProgressElementElapsed, ProgressElementSpeed,
+		ProgressElementBar, ProgressElementPercent, ProgressElementETA,
 	}
 	tests := []struct {
 		name           string
@@ -1248,6 +1307,8 @@ func Test_ciRenderer_pvLine(t *testing.T) {
 		wantPct        float64
 		wantContains   string
 		wantOmitString string
+		wantLine       string // exact line, checked when not empty
+		wantStep       int    // throttling step, checked with wantLine
 	}{
 		{
 			name:          "mid transfer shows ETA",
@@ -1273,13 +1334,88 @@ func Test_ciRenderer_pvLine(t *testing.T) {
 			args:          args{cur: 256, total: 1024},
 			wantFilledGt0: true, wantPct: 25, wantContains: "ETA",
 		},
+		{
+			name: "example full line reversed", fields: example(true, all...),
+			args: exampleArgs, wantPct: 97, wantStep: 31,
+			wantLine: "109M/112M 0:00:01 [78.7M/s] [<===============================]" +
+				"  97% ETA 0:00:00",
+		},
+		{
+			name: "example full line forward", fields: example(false, all...),
+			args: exampleArgs, wantPct: 97, wantStep: 31,
+			wantLine: "109M/112M 0:00:01 [78.7M/s] [===============================>]" +
+				"  97% ETA 0:00:00",
+		},
+		{
+			name: "example without bar",
+			fields: example(true, ProgressElementETA, ProgressElementPercent,
+				ProgressElementSpeed, ProgressElementElapsed, ProgressElementBytes),
+			args: exampleArgs, wantPct: 97, wantStep: 97,
+			wantLine: "109M/112M 0:00:01 [78.7M/s]  97% ETA 0:00:00",
+		},
+		{
+			name: "example without bytes and bar",
+			fields: example(true, ProgressElementElapsed, ProgressElementSpeed,
+				ProgressElementPercent, ProgressElementETA),
+			args: exampleArgs, wantPct: 97, wantStep: 97,
+			wantLine: "0:00:01 [78.7M/s]  97% ETA 0:00:00",
+		},
+		{
+			name: "example elapsed speed and ETA",
+			fields: example(true, ProgressElementElapsed, ProgressElementSpeed,
+				ProgressElementETA),
+			args: exampleArgs, wantPct: 97, wantStep: 97,
+			wantLine: "0:00:01 [78.7M/s] ETA 0:00:00",
+		},
+		{
+			name: "example elapsed percent and ETA",
+			fields: example(true, ProgressElementElapsed, ProgressElementPercent,
+				ProgressElementETA),
+			args: exampleArgs, wantPct: 97, wantStep: 97,
+			wantLine: "0:00:01  97% ETA 0:00:00",
+		},
+		{
+			name:   "example bytes and ETA",
+			fields: example(true, ProgressElementETA, ProgressElementBytes),
+			args:   exampleArgs, wantPct: 97, wantStep: 97,
+			wantLine: "109M/112M ETA 0:00:00",
+		},
+		{
+			name: "only bytes", fields: example(false, ProgressElementBytes),
+			args: exampleArgs, wantPct: 97, wantStep: 97, wantLine: "109M/112M",
+		},
+		{
+			name: "only elapsed", fields: example(false, ProgressElementElapsed),
+			args: exampleArgs, wantPct: 97, wantStep: 97, wantLine: "0:00:01",
+		},
+		{
+			name: "only speed", fields: example(false, ProgressElementSpeed),
+			args: exampleArgs, wantPct: 97, wantStep: 97, wantLine: "[78.7M/s]",
+		},
+		{
+			name: "only bar", fields: example(false, ProgressElementBar),
+			args: exampleArgs, wantPct: 97, wantStep: 74,
+			wantLine: "[" + strings.Repeat("=", 74) + ">--]",
+		},
+		{
+			name: "only percent", fields: example(false, ProgressElementPercent),
+			args: exampleArgs, wantPct: 97, wantStep: 97, wantLine: " 97%",
+		},
+		{
+			name: "only ETA", fields: example(false, ProgressElementETA),
+			args: exampleArgs, wantPct: 97, wantStep: 97, wantLine: "ETA 0:00:00",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := newCIRenderer(io.Discard, tt.args.total, false)
+			r := newCIRenderer(io.Discard, tt.args.total, tt.fields.reverse)
 			r.speedEWMA = tt.fields.speedEWMA
-			r.startedAt = time.Now()
-			got, filled, pct := r.pvLine(tt.args.cur, tt.args.total, time.Now())
+			if tt.fields.elements != 0 {
+				r.elements = tt.fields.elements
+			}
+			start := time.Now()
+			r.startedAt = start
+			got, filled, pct := r.pvLine(tt.args.cur, tt.args.total, start.Add(tt.fields.elapsed))
 			if len(got) == 0 {
 				t.Error("pvLine must produce a non-empty line")
 			}
@@ -1295,12 +1431,17 @@ func Test_ciRenderer_pvLine(t *testing.T) {
 			if tt.wantOmitString != "" && strings.Contains(got, tt.wantOmitString) {
 				t.Errorf("pvLine = %q, must not contain %q", got, tt.wantOmitString)
 			}
+			if tt.wantLine != "" && (got != tt.wantLine || filled != tt.wantStep) {
+				t.Errorf("pvLine = %q, step %d, want %q, step %d",
+					got, filled, tt.wantLine, tt.wantStep)
+			}
 		})
 	}
 }
 
 func Test_ciRenderer_renderWaveLine(t *testing.T) {
 	type args struct {
+		w       int
 		advance bool
 	}
 	tests := []struct {
@@ -1309,23 +1450,33 @@ func Test_ciRenderer_renderWaveLine(t *testing.T) {
 		args             args
 		wantLen          int
 		wantStateChanges bool
+		wantBarPos       int // marker start after the call
 	}{
 		{name: "advance mutates tick and barPos", barPos: 0,
-			args: args{advance: true}, wantLen: ciBarWidth, wantStateChanges: true},
+			args: args{w: ciBarWidth, advance: true}, wantLen: ciBarWidth,
+			wantStateChanges: true, wantBarPos: 1},
 		{name: "no advance leaves state intact", barPos: 0,
-			args: args{advance: false}, wantLen: ciBarWidth, wantStateChanges: false},
+			args: args{w: ciBarWidth, advance: false}, wantLen: ciBarWidth,
+			wantStateChanges: false, wantBarPos: 0},
 		{name: "barPos at right edge does not panic", barPos: ciBarWidth - ciBarMarkerLen - 1,
-			args: args{advance: false}, wantLen: ciBarWidth, wantStateChanges: false},
+			args: args{w: ciBarWidth, advance: false}, wantLen: ciBarWidth,
+			wantStateChanges: false, wantBarPos: ciBarWidth - ciBarMarkerLen - 1},
+		{name: "narrower line pulls the marker inside",
+			barPos: ciBarWidth - ciBarMarkerLen - 1, args: args{w: 30, advance: false},
+			wantLen: 30, wantStateChanges: true, wantBarPos: 30 - ciBarMarkerLen - 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := newCIRenderer(io.Discard, 0, false)
 			r.barPos = tt.barPos
 			tickBefore, posBefore := r.tick, r.barPos
-			got := r.renderWaveLine(tt.args.advance)
+			got := r.renderWaveLine(tt.args.w, tt.args.advance)
 			if len(got) != tt.wantLen {
 				t.Errorf("ciRenderer.renderWaveLine() len = %d, want %d",
 					len(got), tt.wantLen)
+			}
+			if r.barPos != tt.wantBarPos {
+				t.Errorf("barPos = %d, want %d", r.barPos, tt.wantBarPos)
 			}
 			changed := r.tick != tickBefore || r.barPos != posBefore
 			if changed != tt.wantStateChanges {
@@ -1337,33 +1488,430 @@ func Test_ciRenderer_renderWaveLine(t *testing.T) {
 	}
 }
 
-func Test_ciRenderer_renderWaveLineWithBytes(t *testing.T) {
+// elementsOf builds a progress element set for test tables.
+func elementsOf(elems ...ProgressElement) progressElements {
+	return newProgressElements(elems)
+}
+
+// waveOf renders the first wave frame of a fresh renderer, w columns wide.
+func waveOf(w int) string {
+	return newCIRenderer(io.Discard, 0, false).renderWaveLine(w, true)
+}
+
+var mpbSpeedRe = regexp.MustCompile(`([0-9]+\.[0-9]{2}) (b|KiB|MiB|GiB|TiB)/s`)
+
+// hasNonZeroSpeed reports whether mpb output shows a non-zero EWMA speed.
+func hasNonZeroSpeed(s string) bool {
+	for _, m := range mpbSpeedRe.FindAllStringSubmatch(s, -1) {
+		if m[1] != "0.00" {
+			return true
+		}
+	}
+	return false
+}
+
+func Test_newProgressElements(t *testing.T) {
 	type args struct {
-		cur int64
+		elems []ProgressElement
 	}
 	tests := []struct {
-		name         string
-		args         args
-		wantLen      int
-		wantContains string
+		name string
+		args args
+		want progressElements
 	}{
-		{name: "bytes suffix right aligned", args: args{cur: 500},
-			wantLen: ciBarWidth, wantContains: "500 B"},
-		{name: "large value uses binary suffix", args: args{cur: 1 << 30},
-			wantLen: ciBarWidth, wantContains: "GiB"},
+		{name: "bytes", args: args{elems: []ProgressElement{ProgressElementBytes}}, want: 1},
+		{name: "elapsed", args: args{elems: []ProgressElement{ProgressElementElapsed}},
+			want: 2},
+		{name: "speed", args: args{elems: []ProgressElement{ProgressElementSpeed}}, want: 4},
+		{name: "bar", args: args{elems: []ProgressElement{ProgressElementBar}}, want: 8},
+		{name: "percent", args: args{elems: []ProgressElement{ProgressElementPercent}},
+			want: 16},
+		{name: "ETA", args: args{elems: []ProgressElement{ProgressElementETA}}, want: 32},
+		{name: "no elements", args: args{}, want: 0},
+		{
+			name: "duplicates and order are ignored",
+			args: args{elems: []ProgressElement{
+				ProgressElementETA, ProgressElementBytes, ProgressElementETA,
+			}},
+			want: 33,
+		},
+		{
+			name: "unknown values are ignored",
+			args: args{elems: []ProgressElement{-1, ProgressElementETA + 1, ProgressElementBar}},
+			want: 8,
+		},
+		{
+			name: "all elements make the full line",
+			args: args{elems: []ProgressElement{
+				ProgressElementBytes, ProgressElementElapsed, ProgressElementSpeed,
+				ProgressElementBar, ProgressElementPercent, ProgressElementETA,
+			}},
+			want: progressAllElements,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := newCIRenderer(io.Discard, 0, false)
-			r.startedAt = time.Now()
-			got := r.renderWaveLineWithBytes(tt.args.cur)
-			if len(got) != tt.wantLen {
-				t.Errorf("ciRenderer.renderWaveLineWithBytes() len = %d, want %d",
-					len(got), tt.wantLen)
+			if got := newProgressElements(tt.args.elems); got != tt.want {
+				t.Errorf("newProgressElements() = %v, want %v", got, tt.want)
 			}
-			if !strings.Contains(got, tt.wantContains) {
-				t.Errorf("ciRenderer.renderWaveLineWithBytes() = %q, want substring %q",
-					got, tt.wantContains)
+		})
+	}
+}
+
+func Test_newProgressConfig(t *testing.T) {
+	type args struct {
+		opts []ProgressOption
+	}
+	buf := &bytes.Buffer{}
+	tests := []struct {
+		name string
+		args args
+		want progressConfig
+	}{
+		{name: "no options", args: args{}, want: progressConfig{}},
+		{
+			name: "name",
+			args: args{opts: []ProgressOption{WithProgressName("pkg")}},
+			want: progressConfig{opts: ProgressOptions{Name: "pkg"}},
+		},
+		{
+			name: "total",
+			args: args{opts: []ProgressOption{WithProgressTotal(42)}},
+			want: progressConfig{opts: ProgressOptions{Total: 42}},
+		},
+		{
+			name: "stderr",
+			args: args{opts: []ProgressOption{WithProgressStderr(buf)}},
+			want: progressConfig{opts: ProgressOptions{Stderr: buf}},
+		},
+		{
+			name: "CI mode on",
+			args: args{opts: []ProgressOption{WithProgressCIMode(true)}},
+			want: progressConfig{opts: ProgressOptions{CIMode: ptrBool(true)}},
+		},
+		{
+			name: "CI mode off",
+			args: args{opts: []ProgressOption{WithProgressCIMode(false)}},
+			want: progressConfig{opts: ProgressOptions{CIMode: ptrBool(false)}},
+		},
+		{
+			name: "no progress bar",
+			args: args{opts: []ProgressOption{WithProgressNoProgressBar(true)}},
+			want: progressConfig{opts: ProgressOptions{NoProgressBar: true}},
+		},
+		{
+			name: "reverse",
+			args: args{opts: []ProgressOption{WithProgressReverse(true)}},
+			want: progressConfig{opts: ProgressOptions{Reverse: true}},
+		},
+		{
+			name: "refresh rate",
+			args: args{opts: []ProgressOption{WithProgressRefreshRate(time.Second)}},
+			want: progressConfig{opts: ProgressOptions{RefreshRate: time.Second}},
+		},
+		{
+			name: "elements",
+			args: args{opts: []ProgressOption{
+				WithProgressElements(ProgressElementBar, ProgressElementBytes),
+			}},
+			want: progressConfig{
+				elements: elementsOf(ProgressElementBytes, ProgressElementBar), custom: true,
+			},
+		},
+		{
+			name: "elements without arguments select an empty set",
+			args: args{opts: []ProgressOption{WithProgressElements()}},
+			want: progressConfig{custom: true},
+		},
+		{
+			name: "last elements option wins",
+			args: args{opts: []ProgressOption{
+				WithProgressElements(ProgressElementBytes),
+				WithProgressElements(ProgressElementETA),
+			}},
+			want: progressConfig{elements: elementsOf(ProgressElementETA), custom: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := newProgressConfig(tt.args.opts); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("newProgressConfig() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewProgress(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		opts []ProgressOption
+	}
+	// stopped makes the CI render loop exit at once, so only the frames
+	// driven by the test are printed.
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	ciOut, noBarOut, noBytesOut := &bytes.Buffer{}, &bytes.Buffer{}, &bytes.Buffer{}
+	addOut, writeOut := &bytes.Buffer{}, &bytes.Buffer{}
+	elapsedRe := regexp.MustCompile(`[0-9]:[0-9]{2}:[0-9]{2}`)
+	// mpb renders into the non-terminal buffers only with auto refresh.
+	mpbContainerOptions = []mpb.ContainerOption{mpb.WithAutoRefresh()}
+	defer func() { mpbContainerOptions = nil }()
+	tests := []struct {
+		name  string
+		args  args
+		want  ProgressBar
+		check func(t *testing.T, got ProgressBar) // replaces want when set
+	}{
+		{
+			name: "empty element set in CI mode renders nothing",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(true), WithProgressStderr(io.Discard),
+				WithProgressElements(),
+			}},
+			want: noopProgressBar{},
+		},
+		{
+			name: "unknown elements in mpb mode render nothing",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(io.Discard),
+				WithProgressElements(-1),
+			}},
+			want: noopProgressBar{},
+		},
+		{
+			name: "no progress bar wins over elements",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressNoProgressBar(true), WithProgressElements(ProgressElementBar),
+			}},
+			want: noopProgressBar{},
+		},
+		{
+			name: "no elements option renders the full line",
+			args: args{ctx: stopped, opts: []ProgressOption{
+				WithProgressCIMode(true), WithProgressStderr(io.Discard),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				cp, ok := got.(*ciProgressBar)
+				if !ok {
+					t.Fatalf("NewProgress() = %T, want *ciProgressBar", got)
+				}
+				defer cp.Finish(nil)
+				if cp.r.elements != progressAllElements {
+					t.Errorf("elements = %b, want %b", cp.r.elements, progressAllElements)
+				}
+			},
+		},
+		{
+			name: "CI mode switches from unknown to known size",
+			args: args{ctx: stopped, opts: []ProgressOption{
+				WithProgressCIMode(true), WithProgressStderr(ciOut), WithProgressTotal(-1),
+				WithProgressElements(ProgressElementPercent, ProgressElementBytes),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				cp, ok := got.(*ciProgressBar)
+				if !ok {
+					t.Fatalf("NewProgress() = %T, want *ciProgressBar", got)
+				}
+				<-cp.r.done
+				ciOut.Reset()
+				cp.AddBytes(512)
+				cp.r.frame()
+				cp.r.frame()
+				cp.SetTotal(1024)
+				cp.r.frame()
+				cp.Finish(nil)
+				want := "512B\n512B/1.0K  50%\n512B/1.0K  50%\n"
+				if s := ciOut.String(); s != want {
+					t.Errorf("output = %q, want %q", s, want)
+				}
+			},
+		},
+		{
+			name: "mpb without bar element draws no bar",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(noBarOut), WithProgressTotal(100),
+				WithProgressRefreshRate(time.Millisecond),
+				WithProgressElements(ProgressElementPercent, ProgressElementBytes),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				got.AddBytes(100)
+				got.Finish(nil)
+				s := noBarOut.String()
+				if !strings.Contains(s, "100%") || !strings.Contains(s, " / ") ||
+					strings.Contains(s, "|") {
+					t.Errorf("output = %q, want percent and counters without a bar", s)
+				}
+			},
+		},
+		{
+			name: "mpb without bytes element draws no counters",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(noBytesOut), WithProgressTotal(100),
+				WithProgressRefreshRate(time.Millisecond),
+				WithProgressElements(ProgressElementETA, ProgressElementBar,
+					ProgressElementSpeed, ProgressElementElapsed),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				got.AddBytes(100)
+				got.Finish(nil)
+				s := noBytesOut.String()
+				if !strings.Contains(s, "|") || !elapsedRe.MatchString(s) ||
+					strings.Contains(s, " / ") || strings.Contains(s, "%") {
+					t.Errorf("output = %q, want bar and elapsed time without counters", s)
+				}
+			},
+		},
+		{
+			name: "mpb AddBytes feeds the EWMA speed",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(addOut),
+				WithProgressRefreshRate(time.Millisecond),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				for i := 0; i < 12; i++ {
+					time.Sleep(2 * time.Millisecond)
+					got.AddBytes(1024)
+				}
+				got.Finish(nil)
+				if s := addOut.String(); !hasNonZeroSpeed(s) {
+					t.Errorf("output = %q, want a non-zero speed", s)
+				}
+			},
+		},
+		{
+			name: "mpb WrapWriter feeds the EWMA speed",
+			args: args{ctx: context.Background(), opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(writeOut),
+				WithProgressRefreshRate(time.Millisecond),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				w := got.WrapWriter(io.Discard)
+				for i := 0; i < 12; i++ {
+					time.Sleep(2 * time.Millisecond)
+					if _, err := w.Write(make([]byte, 1024)); err != nil {
+						t.Fatalf("Write: %v", err)
+					}
+				}
+				if err := w.Close(); err != nil {
+					t.Errorf("Close() error = %v, want nil", err)
+				}
+				got.Finish(nil)
+				if s := writeOut.String(); !hasNonZeroSpeed(s) {
+					t.Errorf("output = %q, want a non-zero speed", s)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewProgress(tt.args.ctx, tt.args.opts...)
+			if tt.check != nil {
+				tt.check(t, got)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("NewProgress() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_ciRenderer_composeLine(t *testing.T) {
+	type fields struct {
+		elements progressElements
+	}
+	type args struct {
+		cur int64
+		now time.Time
+	}
+	start := time.Now()
+	at := args{cur: 109 << 20, now: start.Add(time.Second)}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   string
+	}{
+		{name: "only bytes", fields: fields{elementsOf(ProgressElementBytes)}, args: at,
+			want: "109M"},
+		{name: "only elapsed", fields: fields{elementsOf(ProgressElementElapsed)}, args: at,
+			want: "0:00:01"},
+		{name: "only speed", fields: fields{elementsOf(ProgressElementSpeed)}, args: at,
+			want: "[78.7M/s]"},
+		{name: "only bar draws a full-width wave",
+			fields: fields{elementsOf(ProgressElementBar)}, args: at, want: waveOf(ciBarWidth)},
+		{name: "percent and ETA are hidden",
+			fields: fields{elementsOf(ProgressElementPercent, ProgressElementETA)}, args: at,
+			want: ""},
+		{name: "bytes and bar",
+			fields: fields{elementsOf(ProgressElementBar, ProgressElementBytes)},
+			args:   at, want: "109M " + waveOf(ciBarWidth-5)},
+		{name: "full line", fields: fields{progressAllElements}, args: at,
+			want: "109M 0:00:01 [78.7M/s] " + waveOf(ciBarWidth-23)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newCIRenderer(io.Discard, -1, false)
+			r.elements = tt.fields.elements
+			r.startedAt = start
+			r.speedEWMA = 82523750
+			if got := r.composeLine(tt.args.cur, tt.args.now); got != tt.want {
+				t.Errorf("ciRenderer.composeLine() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_ciRenderer_printComposeIfDue(t *testing.T) {
+	type fields struct {
+		elements    progressElements
+		lastCompose time.Time
+	}
+	type args struct {
+		cur int64
+		now time.Time
+	}
+	now := time.Now()
+	at := args{cur: 512, now: now}
+	tests := []struct {
+		name        string
+		fields      fields
+		args        args
+		wantPrinted bool
+	}{
+		{name: "first line prints", fields: fields{elements: progressAllElements},
+			args: at, wantPrinted: true},
+		{name: "line within a second is suppressed",
+			fields: fields{
+				elements: progressAllElements, lastCompose: now.Add(-999 * time.Millisecond),
+			},
+			args: at, wantPrinted: false},
+		{name: "line a second later prints",
+			fields: fields{elements: progressAllElements, lastCompose: now.Add(-time.Second)},
+			args:   at, wantPrinted: true},
+		{name: "empty line is not printed",
+			fields: fields{elements: elementsOf(ProgressElementPercent, ProgressElementETA)},
+			args:   at, wantPrinted: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			r := newCIRenderer(buf, -1, false)
+			r.elements = tt.fields.elements
+			r.lastCompose = tt.fields.lastCompose
+			r.startedAt = now
+			r.printComposeIfDue(tt.args.cur, tt.args.now)
+			printed := buf.Len() > 0
+			if printed != tt.wantPrinted {
+				t.Errorf("printComposeIfDue printed=%v, want %v (buf=%q)",
+					printed, tt.wantPrinted, buf.String())
+			}
+			wantLast := tt.fields.lastCompose
+			if tt.wantPrinted {
+				wantLast = tt.args.now
+			}
+			if !r.lastCompose.Equal(wantLast) {
+				t.Errorf("lastCompose = %v, want %v", r.lastCompose, wantLast)
 			}
 		})
 	}
