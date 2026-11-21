@@ -10,6 +10,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1652,6 +1653,14 @@ func TestNewProgress(t *testing.T) {
 	cancel()
 	ciOut, noBarOut, noBytesOut := &bytes.Buffer{}, &bytes.Buffer{}, &bytes.Buffer{}
 	addOut, writeOut := &bytes.Buffer{}, &bytes.Buffer{}
+	// canceledOut collects the output of the mpb bar built on the already
+	// canceled stopped context; live and ciLive are canceled by their cases
+	// after the bar is built.
+	canceledOut := &bytes.Buffer{}
+	live, stopLive := context.WithCancel(context.Background())
+	defer stopLive()
+	ciLive, stopCILive := context.WithCancel(context.Background())
+	defer stopCILive()
 	elapsedRe := regexp.MustCompile(`[0-9]:[0-9]{2}:[0-9]{2}`)
 	// mpb renders into the non-terminal buffers only with auto refresh.
 	mpbContainerOptions = []mpb.ContainerOption{mpb.WithAutoRefresh()}
@@ -1801,6 +1810,67 @@ func TestNewProgress(t *testing.T) {
 				}
 			},
 		},
+		{
+			name: "mpb on a canceled context renders nothing",
+			args: args{ctx: stopped, opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(canceledOut), WithProgressTotal(100),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				if _, ok := got.(noopProgressBar); !ok {
+					t.Errorf("NewProgress() = %T, want noopProgressBar", got)
+				}
+				exerciseBar(t, got)
+				if s := canceledOut.String(); s != "" {
+					t.Errorf("output = %q, want empty", s)
+				}
+			},
+		},
+		{
+			name: "mpb bar canceled after creation stays safe",
+			args: args{ctx: live, opts: []ProgressOption{
+				WithProgressCIMode(false), WithProgressStderr(io.Discard), WithProgressTotal(100),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				mp, ok := got.(*mpbProgressBar)
+				if !ok {
+					t.Fatalf("NewProgress() = %T, want *mpbProgressBar", got)
+				}
+				stopLive()
+				// Once the bar has stopped, mpb hands out no proxy reader any more.
+				mp.bar.Wait()
+				exerciseBar(t, got)
+			},
+		},
+		{
+			// The output is not checked: the render loop may still print
+			// frames until it notices the canceled context.
+			name: "CI on a canceled context stays safe",
+			args: args{ctx: stopped, opts: []ProgressOption{
+				WithProgressCIMode(true), WithProgressStderr(io.Discard), WithProgressTotal(100),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				if _, ok := got.(*ciProgressBar); !ok {
+					t.Fatalf("NewProgress() = %T, want *ciProgressBar", got)
+				}
+				exerciseBar(t, got)
+			},
+		},
+		{
+			name: "CI canceled after start keeps the bar safe",
+			args: args{ctx: ciLive, opts: []ProgressOption{
+				WithProgressCIMode(true), WithProgressStderr(io.Discard), WithProgressTotal(100),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				cp, ok := got.(*ciProgressBar)
+				if !ok {
+					t.Fatalf("NewProgress() = %T, want *ciProgressBar", got)
+				}
+				got.AddBytes(50)
+				stopCILive()
+				<-cp.r.done
+				exerciseBar(t, got)
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1914,5 +1984,217 @@ func Test_ciRenderer_printComposeIfDue(t *testing.T) {
 				t.Errorf("lastCompose = %v, want %v", r.lastCompose, wantLast)
 			}
 		})
+	}
+}
+
+func TestNewProgressBar(t *testing.T) {
+	type args struct {
+		ctx  context.Context
+		opts ProgressOptions
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	live, stopLive := context.WithCancel(context.Background())
+	defer stopLive()
+	canceledOut := &bytes.Buffer{}
+	// mpb renders into non-terminal writers only with auto refresh.
+	mpbContainerOptions = []mpb.ContainerOption{mpb.WithAutoRefresh()}
+	defer func() { mpbContainerOptions = nil }()
+	tests := []struct {
+		name  string
+		args  args
+		want  ProgressBar                         // nil accepts any bar
+		check func(t *testing.T, got ProgressBar) // runs after want is compared
+	}{
+		{
+			name: "mpb on a canceled context renders nothing",
+			args: args{ctx: canceled, opts: ProgressOptions{
+				Total: 100, Stderr: canceledOut, CIMode: ptrBool(false),
+			}},
+			want: noopProgressBar{},
+			check: func(t *testing.T, got ProgressBar) {
+				exerciseBar(t, got)
+				if s := canceledOut.String(); s != "" {
+					t.Errorf("output = %q, want empty", s)
+				}
+			},
+		},
+		{
+			name: "mpb bar canceled after creation stays safe",
+			args: args{ctx: live, opts: ProgressOptions{
+				Total: 100, Stderr: io.Discard, CIMode: ptrBool(false),
+			}},
+			check: func(t *testing.T, got ProgressBar) {
+				mp, ok := got.(*mpbProgressBar)
+				if !ok {
+					t.Fatalf("NewProgressBar() = %T, want *mpbProgressBar", got)
+				}
+				stopLive()
+				// Once the bar has stopped, mpb hands out no proxy reader any more.
+				mp.bar.Wait()
+				exerciseBar(t, got)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewProgressBar(tt.args.ctx, tt.args.opts)
+			if tt.want != nil && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("NewProgressBar() = %v, want %v", got, tt.want)
+			}
+			if tt.check != nil {
+				tt.check(t, got)
+			}
+		})
+	}
+}
+
+func Test_newProgress(t *testing.T) {
+	type args struct {
+		ctx context.Context
+		cfg progressConfig
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	seamOut := &bytes.Buffer{}
+	addBar := mpbAddBar
+	defer func() { mpbAddBar = addBar }()
+	// mpb renders into non-terminal writers only with auto refresh.
+	mpbContainerOptions = []mpb.ContainerOption{mpb.WithAutoRefresh()}
+	defer func() { mpbContainerOptions = nil }()
+	mpbConfig := func(w io.Writer) progressConfig {
+		return progressConfig{opts: ProgressOptions{
+			Total: 10, Stderr: w, CIMode: ptrBool(false),
+		}}
+	}
+	tests := []struct {
+		name string
+		args args
+		want ProgressBar // nil accepts any bar
+		// runs repeats the call, each time on a fresh child of args.ctx.
+		runs int
+		// beforeAdd runs between creating the mpb container and adding the
+		// bar; cancel cancels the context of the current call.
+		beforeAdd func(p *mpb.Progress, cancel context.CancelFunc)
+		check     func(t *testing.T) // runs after all the calls
+	}{
+		{
+			name: "canceled before the call starts no goroutines",
+			args: args{ctx: canceled, cfg: mpbConfig(io.Discard)},
+			want: noopProgressBar{},
+			runs: 1,
+		},
+		{
+			name: "canceled between container and bar renders nothing",
+			args: args{ctx: context.Background(), cfg: mpbConfig(seamOut)},
+			want: noopProgressBar{},
+			runs: 1,
+			beforeAdd: func(p *mpb.Progress, cancel context.CancelFunc) {
+				cancel()
+				// Waiting for the container to stop makes adding the bar fail.
+				p.Shutdown()
+			},
+			check: func(t *testing.T) {
+				if s := seamOut.String(); s != "" {
+					t.Errorf("output = %q, want empty", s)
+				}
+			},
+		},
+		{
+			name: "cancel concurrent with adding the bar never panics",
+			args: args{ctx: context.Background(), cfg: mpbConfig(io.Discard)},
+			runs: 200,
+			beforeAdd: func(_ *mpb.Progress, cancel context.CancelFunc) {
+				go cancel()
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := runtime.NumGoroutine()
+			for i := 0; i < tt.runs; i++ {
+				ctx, cancel := context.WithCancel(tt.args.ctx)
+				mpbAddBar = func(
+					p *mpb.Progress, total int64, filler mpb.BarFiller,
+					options ...mpb.BarOption,
+				) (*mpb.Bar, error) {
+					if tt.beforeAdd != nil {
+						tt.beforeAdd(p, cancel)
+					}
+					return addBar(p, total, filler, options...)
+				}
+				got := newProgress(ctx, tt.args.cfg)
+				if tt.want != nil && !reflect.DeepEqual(got, tt.want) {
+					t.Errorf("newProgress() = %v, want %v", got, tt.want)
+				}
+				exerciseBar(t, got)
+				cancel()
+			}
+			mpbAddBar = addBar
+			if tt.check != nil {
+				tt.check(t)
+			}
+			waitGoroutines(t, before)
+		})
+	}
+}
+
+// exerciseBar calls every ProgressBar method the way a transfer does and
+// fails unless all of them return within 5s; the wrappers must pass the data
+// through unchanged. The results are checked only after all the methods have
+// returned, so a late method never reports into a finished test.
+func exerciseBar(t *testing.T, bar ProgressBar) {
+	t.Helper()
+	var read []byte
+	var readErr, readCloseErr, writeErr, writeCloseErr error
+	var written int
+	var sink bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bar.AddBytes(3)
+		bar.SetTotal(10)
+		r := bar.WrapReader(strings.NewReader("abc"))
+		read, readErr = io.ReadAll(r)
+		readCloseErr = r.Close()
+		w := bar.WrapWriter(&sink)
+		written, writeErr = w.Write([]byte("abc"))
+		writeCloseErr = w.Close()
+		bar.Finish(nil)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ProgressBar methods did not return within 5s")
+	}
+	if readErr != nil || string(read) != "abc" {
+		t.Errorf("WrapReader read %q, %v, want %q, nil", read, readErr, "abc")
+	}
+	if readCloseErr != nil {
+		t.Errorf("WrapReader Close() error = %v, want nil", readCloseErr)
+	}
+	if writeErr != nil || written != 3 {
+		t.Errorf("WrapWriter wrote %d, %v, want 3, nil", written, writeErr)
+	}
+	if writeCloseErr != nil {
+		t.Errorf("WrapWriter Close() error = %v, want nil", writeCloseErr)
+	}
+	if s := sink.String(); s != "abc" {
+		t.Errorf("WrapWriter passed %q, want %q", s, "abc")
+	}
+}
+
+// waitGoroutines fails unless the number of goroutines drops back to at most
+// want within 5s: mpb ends some of its goroutines only after Shutdown or Wait
+// has returned.
+func waitGoroutines(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > want {
+		if time.Now().After(deadline) {
+			t.Errorf("goroutines = %d, want at most %d", runtime.NumGoroutine(), want)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
