@@ -615,7 +615,9 @@ func newProgressConfig(opts []ProgressOption) progressConfig {
 
 // ProgressBar is a progress bar controller living on top of an arbitrary
 // stream. An instance is created by NewProgress or NewProgressBar and is no
-// longer used after Finish.
+// longer used after Finish. Its methods stay safe to call after the context
+// given to the constructor is canceled, and Finish then returns without
+// waiting for progress that will never come.
 type ProgressBar interface {
 	// WrapReader returns an io.ReadCloser that adds the number of bytes read
 	// to the bar's counter on every Read. Close closes the wrapped reader
@@ -752,7 +754,12 @@ func (c *mpbCountingWriteCloser) Write(p []byte) (int, error) {
 func (c *mpbCountingWriteCloser) Close() error { return nil }
 
 func (m *mpbProgressBar) WrapReader(r io.Reader) io.ReadCloser {
-	return m.bar.ProxyReader(r)
+	// mpb returns nil once the bar has stopped (its context is canceled or it
+	// is complete); the stream then passes through without being counted.
+	if rc := m.bar.ProxyReader(r); rc != nil {
+		return rc
+	}
+	return noopProgressBar{}.WrapReader(r)
 }
 
 func (m *mpbProgressBar) WrapWriter(w io.Writer) io.WriteCloser {
@@ -803,14 +810,14 @@ func (m *mpbProgressBar) Finish(err error) {
 		// freezes the total at whatever was actually written and completes
 		// the bar, letting p.Wait() return.
 		m.bar.SetTotal(-1, true)
-	case !m.bar.Completed():
+	default:
 		// Bars constructed with total > 0 have triggerComplete set, which
 		// makes SetTotal a no-op; aborting (without dropping the bar from
 		// output) is the only way to guarantee p.Wait() returns when
-		// current never reached total.
+		// current never reached total. mpb ignores Abort on a completed or
+		// stopped bar, so the bar state is not read here: once the context
+		// is canceled, reading it races with the final render.
 		m.bar.Abort(false)
-	default:
-		m.bar.SetTotal(-1, true)
 	}
 	m.p.Wait()
 }
@@ -820,13 +827,21 @@ func (m *mpbProgressBar) Finish(err error) {
 // unset, mpb is used; otherwise the line-per-frame CI renderer is used. The
 // context stops the background render loop in both mpb and CI modes. It
 // renders the full progress line; NewProgress also selects its elements.
+// A canceled context never makes it panic. In mpb mode, if the context is
+// already canceled when NewProgressBar is called, no mpb bar is created and
+// the returned bar draws nothing; if it is canceled during the call, the
+// returned bar either draws nothing or is a regular bar that may still draw
+// its final line. The CI renderer may still print frames after the
+// cancellation until its render loop notices it, and Finish may print the
+// final line of a transfer that has already printed progress.
 func NewProgressBar(ctx context.Context, opts ProgressOptions) ProgressBar {
 	return newProgress(ctx, progressConfig{opts: opts})
 }
 
 // NewProgress assembles a ProgressBar like NewProgressBar, configured by
 // functional options. WithProgressElements selects the elements of the line;
-// an empty selection renders nothing.
+// an empty selection renders nothing. A canceled context is handled as by
+// NewProgressBar.
 func NewProgress(ctx context.Context, opts ...ProgressOption) ProgressBar {
 	return newProgress(ctx, newProgressConfig(opts))
 }
@@ -835,6 +850,10 @@ func NewProgress(ctx context.Context, opts ...ProgressOption) ProgressBar {
 // bar. Tests set mpb.WithAutoRefresh() here to render into non-terminal
 // writers, which mpb otherwise leaves empty.
 var mpbContainerOptions []mpb.ContainerOption
+
+// mpbAddBar adds the bar to its mpb container. Tests replace it to cancel the
+// context between creating the container and adding the bar.
+var mpbAddBar = (*mpb.Progress).Add
 
 func newProgress(ctx context.Context, cfg progressConfig) ProgressBar {
 	if ctx == nil {
@@ -860,6 +879,13 @@ func newProgress(ctx context.Context, cfg progressConfig) ProgressBar {
 		r.elements = elements
 		r.Start(ctx)
 		return &ciProgressBar{r: r}
+	}
+	// mpb may still add a bar to a container whose context is already
+	// canceled and then draw the aborted bar, so a canceled context gets a bar
+	// that draws nothing. A cancellation after this check may make adding the
+	// bar fail below.
+	if ctx.Err() != nil {
+		return noopProgressBar{}
 	}
 	createdAt := time.Now()
 	prepend := []decor.Decorator{decor.CountersKibiByte("% .2f / % .2f")}
@@ -894,7 +920,13 @@ func newProgress(ctx context.Context, cfg progressConfig) ProgressBar {
 	} else {
 		barOpts = append(barOpts, mpb.BarFillerTrim())
 	}
-	bar := p.New(opts.Total, filler, barOpts...)
+	bar, err := mpbAddBar(p, opts.Total, filler.Build(), barOpts...)
+	if err != nil {
+		// mpb.ErrDone: the context was canceled while the bar was being added.
+		// Shutdown stops the container together with its goroutines.
+		p.Shutdown()
+		return noopProgressBar{}
+	}
 	return &mpbProgressBar{
 		p: p, bar: bar, indeterminate: opts.Total <= 0, lastIncr: createdAt,
 	}

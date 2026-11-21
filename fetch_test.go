@@ -1,5 +1,6 @@
 // cspell:ignore rawhex stallsig syncfail badurl copyerr defaultdest isdir chmodfail
 // cspell:ignore ctxmid cimode nofile closefail alives oneshot ciresume digesterr
+// cspell:ignore vbauerster
 package ci
 
 import (
@@ -22,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vbauerster/mpb/v8"
 	"golang.org/x/sys/unix"
 )
 
@@ -415,6 +417,22 @@ func Test_downloadOnce(t *testing.T) {
 	defer nonOkSrv.Close()
 
 	destDir := t.TempDir()
+	// midCtx is canceled by cancelingTransport inside the attempt, after the
+	// progress bar was created on it; the transport answers only once that
+	// mpb bar has stopped, so WrapReader always meets a stopped bar.
+	midCtx, cancelMid := context.WithCancel(context.Background())
+	defer cancelMid()
+	var midBar *mpb.Bar
+	addBar := mpbAddBar
+	mpbAddBar = func(
+		p *mpb.Progress, total int64, filler mpb.BarFiller,
+		options ...mpb.BarOption,
+	) (*mpb.Bar, error) {
+		bar, err := addBar(p, total, filler, options...)
+		midBar = bar
+		return bar, err
+	}
+	defer func() { mpbAddBar = addBar }()
 
 	type args struct {
 		ctx  context.Context
@@ -492,6 +510,25 @@ func Test_downloadOnce(t *testing.T) {
 			},
 			wantErr: true,
 			errSub:  "open partial file",
+		},
+		{
+			name: "canceled during the attempt in mpb mode returns the context error",
+			args: args{
+				ctx: midCtx,
+				opts: &DownloadOptions{
+					Name: "ctxmid-mpb.bin",
+					HTTPClient: &http.Client{Transport: &cancelingTransport{
+						cancel: cancelMid, stopped: func() { midBar.Wait() },
+					}},
+					Stderr:       io.Discard,
+					CIMode:       ptrBool(false),
+					StallTimeout: -1,
+				},
+				url:  "http://example/asset", // DevSkim: ignore DS137138
+				dest: filepath.Join(destDir, "ctxmid-mpb.bin"),
+			},
+			wantErr: true,
+			errSub:  "context canceled",
 		},
 	}
 	for _, tt := range tests {
@@ -580,6 +617,25 @@ func Test_downloadOnceCopyError(t *testing.T) {
 type failingBodyTransport struct{}
 
 func (t *failingBodyTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "200 OK",
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(&errReader{err: errors.New("copy failed")}),
+	}, nil
+}
+
+// cancelingTransport cancels the caller's context, waits until the progress
+// bar of the download has stopped and only then serves a failing body, so the
+// download meets the cancellation after its bar was created and stopped.
+type cancelingTransport struct {
+	cancel  context.CancelFunc
+	stopped func()
+}
+
+func (t *cancelingTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	t.cancel()
+	t.stopped()
 	return &http.Response{
 		Status:     "200 OK",
 		StatusCode: http.StatusOK,
@@ -813,6 +869,23 @@ func TestFetchURL(t *testing.T) {
 		}
 		if gotHeader != "yes" {
 			t.Errorf("SetHeaders not applied, got %q", gotHeader)
+		}
+	})
+
+	t.Run("canceled context in mpb mode returns the context error", func(t *testing.T) {
+		// Retry stops before the first attempt, so no bar is created at all.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		dest := filepath.Join(t.TempDir(), "canceled.bin")
+		_, err := FetchURL(ctx, srv.URL, dest, DownloadOptions{
+			Stderr:         io.Discard,
+			CIMode:         ptrBool(false),
+			StallTimeout:   -1,
+			HTTPClient:     srv.Client(),
+			BackoffOptions: BackoffOptions{MaxRetriesTime: -1},
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("FetchURL error = %v, want context.Canceled", err)
 		}
 	})
 
