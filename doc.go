@@ -23,6 +23,10 @@
 //	}
 //	bar.Finish(err)
 //
+// A canceled context never makes the constructors or the bar methods panic:
+// a terminal bar that can no longer be added draws nothing, and Finish
+// returns without waiting for progress that will never come.
+//
 // Functional-option APIs provide context-aware command execution, Git helpers,
 // ordered patch application, tar/xz and LZMA2 archives, GitHub release publishing
 // over net/http, and Telegram Rich Messages with embedded documents. New calls

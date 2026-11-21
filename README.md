@@ -1,6 +1,6 @@
 # Golang library for CI/CD workflows
 
-<!-- cspell:ignore lzma strconv fprintln getenv println ints unparseable dpkg Errorf -->
+<!-- cspell:ignore lzma strconv fprintln getenv println ints unparseable dpkg Errorf goroutines -->
 <!-- markdownlint-disable MD010 MD013 -->
 
 [![lib-test](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml/badge.svg)](https://github.com/megalomania428/go-lib-ci/actions/workflows/repo-test.yaml)
@@ -108,6 +108,10 @@ bar.Finish(err)
 
 In CI logs this prints lines like `0:00:01__97% ETA 0:00:00`: the percentage keeps its three-column padding and the bar, when selected, takes the rest of the 79 columns. Before the first bytes arrive, a wave alone is drawn on every frame for any non-empty set of elements, even if only the percentage and/or ETA are selected. After the first bytes arrive, while the size stays unknown, the percentage and ETA are hidden, the byte counter shows only the transferred bytes, the bar becomes a wave and a line is printed once per second; in this period nothing is printed when no selected element remains. In a terminal only the decorators of the selected elements are drawn, without a bar unless `ProgressElementBar` is selected.
 
+### Canceled context
+
+Neither `NewProgressBar` nor `NewProgress` panics on a canceled context. For an mpb (terminal) bar, when the context is already canceled as the constructor is called, it returns a bar that draws nothing and starts no goroutines. When the context gets canceled during the call, the constructor returns either such a bar, releasing the mpb goroutines, or a regular bar that may still draw its final line before it stops. Once the context is canceled, every method of a bar stays safe to call: `WrapReader` and `WrapWriter` keep passing the data through, and `Finish` returns without waiting for progress that will never come. In CI logs the renderer may still print frames after the cancellation until its render loop notices it; `Finish` may still print the final line of a transfer that has already printed its progress. `FetchURL` relies on this when its context is canceled during a download.
+
 ## Functional-option APIs
 
 New APIs accept `ctx context.Context` first and optional `With…` functions for all remaining settings. Constructors do not need a context. Missing required options wrap `ErrMissingOption`, allowing `errors.Is(err, ci.ErrMissingOption)`. Existing positional APIs are unchanged.
@@ -146,5 +150,5 @@ Network failures, 5xx, 408, 429 and rate-limit 403 responses use `Retry`, honori
 
   ```bash
   git checkout master && git pull
-  git tag -fm $(git branch --sho) v1.0.6 && git push --force origin $(git describe)
+  git tag -fm $(git branch --sho) v1.0.7 && git push --force origin $(git describe)
   ```
